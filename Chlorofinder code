@@ -1,0 +1,371 @@
+# ============================================================
+# CODE 1: TRAIN CHLOROFINDER ON MASSBANK MS2 DATA
+# Corrected version for Option A
+# No hardcoded chlorine chemistry — model learns from spectra
+# Outputs: trained model (.pkl) + evaluation figures
+# ============================================================
+
+import os
+import ast
+import joblib
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from itertools import combinations
+from collections import Counter
+from scipy.sparse import hstack, csr_matrix
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    roc_curve, auc, precision_recall_curve, average_precision_score,
+    confusion_matrix, ConfusionMatrixDisplay,
+    accuracy_score, precision_score, recall_score,
+    f1_score, balanced_accuracy_score, matthews_corrcoef, roc_auc_score
+)
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DATA_CSV    = "/content/cleaned_labeled_fragments.csv"
+FIG_DIR     = "/content/ChloroFinder_Code1_Figures"
+MODEL_OUT   = "/content/chlorofinder_massbank.pkl"
+METRICS_OUT = "/content/chlorofinder_massbank_metrics.csv"
+FI_OUT      = "/content/chlorofinder_massbank_feature_importances.csv"
+TEST_OUT    = "/content/chlorofinder_massbank_test_predictions.csv"
+
+ROUND_DP = 3
+TEST_SIZE = 0.20
+RANDOM_STATE = 42
+
+os.makedirs(FIG_DIR, exist_ok=True)
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+df = pd.read_csv(DATA_CSV)
+
+df["frag_list"] = df["frag_list"].apply(
+    lambda x: x if isinstance(x, list) else ast.literal_eval(str(x))
+)
+
+df["frag_list"] = df["frag_list"].apply(
+    lambda xs: sorted(set(round(float(v), ROUND_DP) for v in xs if float(v) > 0))
+)
+
+df = df[df["frag_list"].map(len) > 0].reset_index(drop=True)
+
+df["chlorinated"] = df["chlorinated"].astype(int)
+
+print(f"Total spectra   : {len(df)}")
+print(f"Chlorinated     : {int(df['chlorinated'].sum())}")
+print(f"Non-chlorinated : {int((df['chlorinated'] == 0).sum())}")
+print(f"Class balance   : {df['chlorinated'].mean():.2%} positive")
+print(f"ROUND_DP        : {ROUND_DP}")
+
+# ============================================================
+# 2. DELTA-M/Z FEATURES
+# ============================================================
+
+def compute_delta_mz_list(frag_list, round_dp=3, min_delta=0.001, max_delta=None):
+    if not frag_list or len(frag_list) < 2:
+        return []
+
+    frags = sorted(set(float(f) for f in frag_list))
+    deltas = []
+
+    for a, b in combinations(frags, 2):
+        d = abs(b - a)
+
+        if d < min_delta:
+            continue
+
+        if max_delta is not None and d > max_delta:
+            continue
+
+        deltas.append(round(d, round_dp))
+
+    return sorted(set(deltas))
+
+
+df["delta_list"] = df["frag_list"].apply(
+    lambda xs: compute_delta_mz_list(xs, round_dp=ROUND_DP)
+)
+
+# ============================================================
+# 3. TRAIN / TEST SPLIT FIRST
+#    This prevents vocabulary leakage from test set into training
+# ============================================================
+
+df_train, df_test = train_test_split(
+    df,
+    test_size=TEST_SIZE,
+    stratify=df["chlorinated"],
+    random_state=RANDOM_STATE
+)
+
+y_train = df_train["chlorinated"].astype(int).values
+y_test = df_test["chlorinated"].astype(int).values
+
+print(f"\nTrain : {len(df_train)}  {Counter(y_train)}")
+print(f"Test  : {len(df_test)}   {Counter(y_test)}")
+
+# ============================================================
+# 4. FIT ENCODERS ON TRAIN ONLY
+# ============================================================
+
+mlb_frag = MultiLabelBinarizer()
+X_frag_train = csr_matrix(
+    mlb_frag.fit_transform(df_train["frag_list"]),
+    dtype=np.float32
+)
+
+X_frag_test = csr_matrix(
+    mlb_frag.transform(df_test["frag_list"]),
+    dtype=np.float32
+)
+
+mlb_delta = MultiLabelBinarizer()
+X_delta_train = csr_matrix(
+    mlb_delta.fit_transform(df_train["delta_list"]),
+    dtype=np.float32
+)
+
+X_delta_test = csr_matrix(
+    mlb_delta.transform(df_test["delta_list"]),
+    dtype=np.float32
+)
+
+X_train = hstack([X_frag_train, X_delta_train], format="csr").astype(np.float32)
+X_test = hstack([X_frag_test, X_delta_test], format="csr").astype(np.float32)
+
+print(f"\nFragment feature dim  : {X_frag_train.shape[1]:,}")
+print(f"Delta-m/z feature dim : {X_delta_train.shape[1]:,}")
+print(f"Total feature dim     : {X_train.shape[1]:,}")
+
+print("\nFragment vocabulary sample:")
+print(list(mlb_frag.classes_[:10]))
+
+print("\nDelta vocabulary sample:")
+print(list(mlb_delta.classes_[:10]))
+
+# ============================================================
+# 5. RANDOM FOREST + GRIDSEARCH
+# ============================================================
+
+param_grid = {
+    "n_estimators":      [100, 200, 300],
+    "max_depth":         [None, 10, 20, 50],
+    "min_samples_split": [2, 5, 10],
+    "min_samples_leaf":  [1, 2, 4],
+    "bootstrap":         [True, False],
+}
+
+base_model = RandomForestClassifier(
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    class_weight="balanced"
+)
+
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=RANDOM_STATE
+)
+
+grid = GridSearchCV(
+    base_model,
+    param_grid,
+    scoring="f1",
+    cv=cv,
+    verbose=1,
+    n_jobs=-1
+)
+
+print("\nStarting GridSearch...")
+grid.fit(X_train, y_train)
+
+best_model = grid.best_estimator_
+
+print("\nBest Parameters:")
+print(grid.best_params_)
+
+# ============================================================
+# 6. EVALUATE ON TEST SET
+# ============================================================
+
+y_prob = best_model.predict_proba(X_test)[:, 1]
+y_pred = (y_prob >= 0.50).astype(int)
+
+metrics = {
+    "Accuracy":          accuracy_score(y_test, y_pred),
+    "Precision":         precision_score(y_test, y_pred, zero_division=0),
+    "Recall":            recall_score(y_test, y_pred, zero_division=0),
+    "F1":                f1_score(y_test, y_pred, zero_division=0),
+    "Balanced Accuracy": balanced_accuracy_score(y_test, y_pred),
+    "MCC":               matthews_corrcoef(y_test, y_pred),
+    "AUC":               roc_auc_score(y_test, y_prob),
+    "AP":                average_precision_score(y_test, y_prob),
+}
+
+print("\nTest Set Performance")
+print("-" * 35)
+for k, v in metrics.items():
+    print(f"{k:<22}: {v:.3f}")
+
+pd.DataFrame([metrics]).to_csv(METRICS_OUT, index=False)
+
+test_out = df_test.copy()
+test_out["ChloroFinder_probability"] = y_prob
+test_out["ChloroFinder_pred_0p5"] = y_pred
+test_out.to_csv(TEST_OUT, index=False)
+
+# ============================================================
+# 7. SAVE MODEL + ENCODERS
+# ============================================================
+
+bundle = {
+    "model": best_model,
+    "mlb_frag": mlb_frag,
+    "mlb_delta": mlb_delta,
+    "round_dp": ROUND_DP,
+    "threshold": 0.50,
+    "best_params": grid.best_params_,
+    "test_metrics": metrics,
+    "feature_type": "fragment_presence_plus_delta_mz_presence",
+    "training_file": DATA_CSV
+}
+
+joblib.dump(bundle, MODEL_OUT)
+
+print(f"\nModel saved: {MODEL_OUT}")
+
+# ============================================================
+# FIGURE A: ROC CURVE
+# ============================================================
+
+fpr, tpr, _ = roc_curve(y_test, y_prob)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6, 5))
+plt.plot(fpr, tpr, lw=2, label=f"ChloroFinder RF, AUC = {roc_auc:.3f}")
+plt.plot([0, 1], [0, 1], "--", color="gray", label="Random")
+plt.fill_between(fpr, tpr, alpha=0.10)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("A. ROC Curve — ChloroFinder, MassBank test set")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_A_ROC.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE B: PRECISION-RECALL CURVE
+# ============================================================
+
+prec, rec, _ = precision_recall_curve(y_test, y_prob)
+ap = average_precision_score(y_test, y_prob)
+baseline = y_test.sum() / len(y_test)
+
+plt.figure(figsize=(6, 5))
+plt.plot(rec, prec, lw=2, label=f"ChloroFinder RF, AP = {ap:.3f}")
+plt.axhline(
+    baseline,
+    linestyle="--",
+    color="gray",
+    label=f"Class baseline = {baseline:.2f}"
+)
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("B. Precision-Recall Curve — ChloroFinder, MassBank test set")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_B_PR_curve.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE C: CONFUSION MATRIX
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(5, 5))
+ConfusionMatrixDisplay(
+    confusion_matrix(y_test, y_pred),
+    display_labels=["Non-Chlorinated", "Chlorinated"]
+).plot(values_format="d", ax=ax)
+plt.title("C. Confusion Matrix — ChloroFinder RF")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_C_confusion_matrix.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE D: SCORE DISTRIBUTION
+# ============================================================
+
+plt.figure(figsize=(6, 5))
+plt.hist(y_prob[y_test == 0], bins=30, alpha=0.7, label="Non-Chlorinated")
+plt.hist(y_prob[y_test == 1], bins=30, alpha=0.7, label="Chlorinated")
+plt.axvline(0.5, color="black", linestyle="--", lw=1.5, label="Threshold = 0.5")
+plt.xlabel("Predicted probability P(chlorinated)")
+plt.ylabel("Count")
+plt.title("D. Score Distribution — ChloroFinder RF")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_D_score_distribution.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE E: FEATURE IMPORTANCE
+# ============================================================
+
+feature_names = np.array(
+    [f"frag_{v}" for v in mlb_frag.classes_]
+    + [f"delta_{v}" for v in mlb_delta.classes_]
+)
+
+fi_df = pd.DataFrame({
+    "feature": feature_names,
+    "importance": best_model.feature_importances_
+})
+
+fi_df["feature_type"] = fi_df["feature"].apply(
+    lambda x: "fragment" if x.startswith("frag_") else "delta_mz"
+)
+
+fi_df.to_csv(FI_OUT, index=False)
+
+top = (
+    fi_df.sort_values("importance", ascending=False)
+    .head(25)
+    .sort_values("importance", ascending=True)
+    .copy()
+)
+
+plt.figure(figsize=(9, 8))
+plt.barh(top["feature"], top["importance"])
+plt.xlabel("Feature importance")
+plt.title(
+    "E. Top 25 Features Learned by ChloroFinder\n"
+    "frag_ = fragment ion | delta_ = pairwise m/z difference"
+)
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_E_feature_importance.png", dpi=300)
+plt.show()
+
+# ============================================================
+# DONE
+# ============================================================
+
+print("\nDONE")
+print(f"Figures saved to : {FIG_DIR}")
+print(f"Metrics saved to : {METRICS_OUT}")
+print(f"Test predictions : {TEST_OUT}")
+print(f"Feature imp.     : {FI_OUT}")
+print(f"Model saved to   : {MODEL_OUT}")
+print("\nReady for corrected Code 2 using the saved round_dp from the model bundle.")
