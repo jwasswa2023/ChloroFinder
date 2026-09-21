@@ -1,4 +1,4 @@
-# Integrating Nontargeted Screening and Machine Learning for Enhanced Annotation and Prioritization of Plastic Degradation Products: A Demonstration Using Chlorinated Thermoplastic Polyurethanes Plastics<img width="468" height="41" alt="image" src="https://github.com/user-attachments/assets/6460606f-6405-44e7-8f66-b306959644d2" />
+# Integrating Nontargeted Screening and Machine Learning for Enhanced Annotation and Prioritization of Plastic Degradation Products: A Demonstration Using Chlorinated Thermoplastic Polyurethane Plastics
 
 
 This repository contains the code, trained machine learning model, reference data, and analytical workflows developed for ChloroFinder, a mass spectrometry-based framework for identifying and prioritizing chlorinated compounds in nontarget LC-HRMS/MS data.
@@ -56,3 +56,15 @@ ChloroFinder/
 ├── Option B Code/
 │
 └── mzML_Files/
+
+---
+
+##  Workflow
+
+```text
+The overall ChloroFinder workflow is:
+
+
+
+
+
