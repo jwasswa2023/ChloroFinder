@@ -1,0 +1,261 @@
+# ============================================================
+# RULE 4 ONLY:
+# BALANCED STRICT MS2 CHLORINE FRAGMENT ISOTOPE PAIR
+# Keeps strict ratio/mass rules, restores OR intensity logic
+# ============================================================
+
+import ast
+import numpy as np
+import pandas as pd
+
+# =========================
+# CONFIG
+# =========================
+INPUT_CSV = "/content/mgf_extracted.csv"
+
+OUT_ALL = "/content/rule4_ms2_cl_fragment_pair_all_features_BALANCED.csv"
+OUT_POS = "/content/rule4_ms2_cl_fragment_pair_positive_features_BALANCED.csv"
+
+MZ_COL = "mz_values"
+INT_COL = "intensity_values"
+
+CL_ISOTOPE_SHIFT = 1.99705
+MZ_TOL = 0.01
+
+MIN_FRAGMENT_INTENSITY = 1000
+MIN_RELATIVE_INTENSITY = 0.10
+
+EXPECTED_PAIR_RATIO = {
+    1: 0.32,
+    2: 0.65
+}
+
+RATIO_TOL = 0.08
+MIN_VALID_PAIRS_FOR_POSITIVE = 2
+
+EPS = 1e-12
+
+# =========================
+# Helper functions
+# =========================
+def safe_parse_list(x):
+    if isinstance(x, list):
+        return [float(v) for v in x]
+
+    if pd.isna(x):
+        return []
+
+    s = str(x).strip()
+
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, (list, tuple)):
+            return [float(v) for v in val]
+    except Exception:
+        pass
+
+    try:
+        return [float(v.strip()) for v in s.strip("[]()").split(",") if v.strip()]
+    except Exception:
+        return []
+
+
+def empty_rule4_result():
+    return {
+        "rule4_cl_fragment_pair": 0,
+        "rule4_cl_fragment_pair_score": 0.0,
+        "rule4_n_valid_pairs": 0,
+        "rule4_light_fragment_mz": np.nan,
+        "rule4_heavy_fragment_mz": np.nan,
+        "rule4_pair_mass_difference": np.nan,
+        "rule4_pair_mass_error": np.nan,
+        "rule4_light_intensity": np.nan,
+        "rule4_heavy_intensity": np.nan,
+        "rule4_heavy_light_ratio": np.nan,
+        "rule4_best_n_cl_fragment": 0,
+        "rule4_ratio_error": np.nan,
+        "rule4_ratio_ok": 0,
+        "rule4_low_intensity_flag": 0
+    }
+
+
+def rule4_cl_fragment_pair_balanced(mz_list, intensity_list):
+
+    if len(mz_list) < 2 or len(intensity_list) < 2:
+        return empty_rule4_result()
+
+    n = min(len(mz_list), len(intensity_list))
+
+    mz_arr = np.array([float(x) for x in mz_list[:n]], dtype=float)
+    int_arr = np.array([float(x) for x in intensity_list[:n]], dtype=float)
+
+    valid = (mz_arr > 0) & (int_arr >= 0)
+    mz_arr = mz_arr[valid]
+    int_arr = int_arr[valid]
+
+    if len(mz_arr) < 2:
+        return empty_rule4_result()
+
+    order = np.argsort(mz_arr)
+    mz_arr = mz_arr[order]
+    int_arr = int_arr[order]
+
+    base_peak = float(np.max(int_arr))
+    intensity_median = float(np.median(int_arr))
+
+    valid_pair_records = []
+    near_pair_low_intensity = 0
+
+    for i in range(len(mz_arr)):
+        for j in range(i + 1, len(mz_arr)):
+
+            light_mz = float(mz_arr[i])
+            heavy_mz = float(mz_arr[j])
+
+            light_int = float(int_arr[i])
+            heavy_int = float(int_arr[j])
+
+            # both fragments must be in top half by intensity
+            if light_int < intensity_median or heavy_int < intensity_median:
+                continue
+
+            pair_diff = heavy_mz - light_mz
+            pair_error = abs(pair_diff - CL_ISOTOPE_SHIFT)
+
+            if pair_error > MZ_TOL:
+                continue
+
+            light_relative = light_int / (base_peak + EPS)
+            heavy_relative = heavy_int / (base_peak + EPS)
+
+            # restored OR logic
+            intensity_ok = (
+                (light_int >= MIN_FRAGMENT_INTENSITY or light_relative >= MIN_RELATIVE_INTENSITY) and
+                (heavy_int >= MIN_FRAGMENT_INTENSITY or heavy_relative >= MIN_RELATIVE_INTENSITY)
+            )
+
+            heavy_light_ratio = heavy_int / (light_int + EPS)
+
+            # physical constraint
+            if heavy_light_ratio >= 1.0:
+                continue
+
+            ratio_errors = {
+                n_cl: abs(heavy_light_ratio - expected)
+                for n_cl, expected in EXPECTED_PAIR_RATIO.items()
+            }
+
+            best_n_cl = min(ratio_errors, key=ratio_errors.get)
+            best_ratio_error = ratio_errors[best_n_cl]
+            ratio_ok = best_ratio_error <= RATIO_TOL
+
+            if pair_error <= MZ_TOL and not intensity_ok:
+                near_pair_low_intensity += 1
+
+            if intensity_ok and ratio_ok:
+                mass_score = max(0.0, 1.0 - (pair_error / MZ_TOL))
+                ratio_score = max(0.0, 1.0 - (best_ratio_error / RATIO_TOL))
+
+                intensity_factor = min(
+                    1.0,
+                    min(light_relative, heavy_relative) / MIN_RELATIVE_INTENSITY
+                )
+
+                score = mass_score * ratio_score * intensity_factor
+
+                valid_pair_records.append({
+                    "score": score,
+                    "light_mz": light_mz,
+                    "heavy_mz": heavy_mz,
+                    "pair_diff": pair_diff,
+                    "pair_error": pair_error,
+                    "light_int": light_int,
+                    "heavy_int": heavy_int,
+                    "heavy_light_ratio": heavy_light_ratio,
+                    "best_n_cl": best_n_cl,
+                    "ratio_error": best_ratio_error,
+                    "ratio_ok": int(ratio_ok)
+                })
+
+    if len(valid_pair_records) == 0:
+        out = empty_rule4_result()
+        out["rule4_low_intensity_flag"] = int(near_pair_low_intensity > 0)
+        return out
+
+    best = max(valid_pair_records, key=lambda x: x["score"])
+    n_valid_pairs = len(valid_pair_records)
+
+    positive = int(n_valid_pairs >= MIN_VALID_PAIRS_FOR_POSITIVE)
+
+    boosted_score = min(
+        1.0,
+        best["score"] * (1 + 0.1 * (n_valid_pairs - 1))
+    )
+
+    if positive == 0:
+        boosted_score = min(boosted_score, 0.49)
+
+    return {
+        "rule4_cl_fragment_pair": positive,
+        "rule4_cl_fragment_pair_score": boosted_score,
+        "rule4_n_valid_pairs": n_valid_pairs,
+        "rule4_light_fragment_mz": best["light_mz"],
+        "rule4_heavy_fragment_mz": best["heavy_mz"],
+        "rule4_pair_mass_difference": best["pair_diff"],
+        "rule4_pair_mass_error": best["pair_error"],
+        "rule4_light_intensity": best["light_int"],
+        "rule4_heavy_intensity": best["heavy_int"],
+        "rule4_heavy_light_ratio": best["heavy_light_ratio"],
+        "rule4_best_n_cl_fragment": best["best_n_cl"],
+        "rule4_ratio_error": best["ratio_error"],
+        "rule4_ratio_ok": best["ratio_ok"],
+        "rule4_low_intensity_flag": 0
+    }
+
+
+# =========================
+# Load data
+# =========================
+df = pd.read_csv(INPUT_CSV)
+
+df["_mz_list"] = df[MZ_COL].apply(safe_parse_list)
+df["_intensity_list"] = df[INT_COL].apply(safe_parse_list)
+
+# =========================
+# Apply Rule 4
+# =========================
+results = []
+
+for _, row in df.iterrows():
+    results.append(
+        rule4_cl_fragment_pair_balanced(
+            mz_list=row["_mz_list"],
+            intensity_list=row["_intensity_list"]
+        )
+    )
+
+rule4_df = pd.DataFrame(results)
+
+df_rule4 = pd.concat(
+    [df.reset_index(drop=True), rule4_df.reset_index(drop=True)],
+    axis=1
+)
+
+df_rule4.to_csv(OUT_ALL, index=False)
+
+df_pos = df_rule4[df_rule4["rule4_cl_fragment_pair"] == 1].copy()
+df_pos.to_csv(OUT_POS, index=False)
+
+print("\nRule 4 BALANCED summary")
+print("Total features:", len(df_rule4))
+print("Rule 4 Cl-fragment-pair positives:", len(df_pos))
+print("Total valid fragment pairs:", int(df_rule4["rule4_n_valid_pairs"].sum()))
+print("1-Cl ratio matches:", int((df_pos["rule4_best_n_cl_fragment"] == 1).sum()))
+print("2-Cl ratio matches:", int((df_pos["rule4_best_n_cl_fragment"] == 2).sum()))
+print("Low-intensity near matches:", int(df_rule4["rule4_low_intensity_flag"].sum()))
+print("Mean Rule 4 score:", df_rule4["rule4_cl_fragment_pair_score"].mean())
+
+print(f"\nSaved all Rule 4 results to: {OUT_ALL}")
+print(f"Saved Rule 4 positives to: {OUT_POS}")
+
+df_pos.head()
