@@ -1,0 +1,294 @@
+# ============================================================
+# RULE 3 ONLY:
+# CHLORINE RADICAL LOSS FROM PRECURSOR IN MS2
+# Checks 35Cl, 37Cl, and double 35Cl radical loss
+# ============================================================
+
+import ast
+import numpy as np
+import pandas as pd
+
+# =========================
+# CONFIG
+# =========================
+INPUT_CSV = "/content/mgf_extracted.csv"
+
+OUT_ALL = "/content/rule3_cl_radical_loss_all_features.csv"
+OUT_POS = "/content/rule3_cl_radical_loss_positive_features.csv"
+
+MZ_COL = "mz_values"
+INT_COL = "intensity_values"
+PRECURSOR_COL = "PEPMASS"
+
+CL35_RADICAL_LOSS = 34.9689
+CL37_RADICAL_LOSS = 36.9659
+DOUBLE_CL35_RADICAL_LOSS = 69.9378
+
+MZ_TOL = 0.01
+
+MIN_FRAGMENT_INTENSITY = 1000
+MIN_RELATIVE_INTENSITY = 0.05
+
+EPS = 1e-12
+
+# =========================
+# Helper functions
+# =========================
+def safe_parse_list(x):
+    if isinstance(x, list):
+        return [float(v) for v in x]
+
+    if pd.isna(x):
+        return []
+
+    s = str(x).strip()
+
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, (list, tuple)):
+            return [float(v) for v in val]
+    except Exception:
+        pass
+
+    try:
+        return [float(v.strip()) for v in s.strip("[]()").split(",") if v.strip()]
+    except Exception:
+        return []
+
+
+def find_best_fragment_match(target_fragment, mz_arr, int_arr, base_peak):
+    errors = np.abs(mz_arr - target_fragment)
+    best_idx = int(np.argmin(errors))
+
+    best_error = float(errors[best_idx])
+    best_mz = float(mz_arr[best_idx])
+    best_intensity = float(int_arr[best_idx])
+    best_relative_intensity = best_intensity / (base_peak + EPS)
+
+    return {
+        "observed_fragment": best_mz,
+        "mass_error": best_error,
+        "fragment_intensity": best_intensity,
+        "relative_intensity": best_relative_intensity
+    }
+
+
+def rule3_cl_radical_loss(precursor_mz, mz_list, intensity_list):
+    """
+    Rule 3:
+    Positive if MS2 contains precursor - Cl radical loss.
+    Checks:
+    - 35Cl radical loss
+    - 37Cl radical loss
+    - double 35Cl radical loss
+    """
+
+    if len(mz_list) == 0 or len(intensity_list) == 0:
+        return {
+            "rule3_cl_radical_loss": 0,
+            "rule3_cl_radical_loss_score": 0.0,
+            "rule3_loss_type": "none",
+            "rule3_expected_fragment": np.nan,
+            "rule3_observed_fragment": np.nan,
+            "rule3_mass_error": np.nan,
+            "rule3_fragment_intensity": np.nan,
+            "rule3_relative_intensity": np.nan,
+            "rule3_low_intensity_flag": 0,
+            "rule3_35cl_37cl_pair_flag": 0
+        }
+
+    n = min(len(mz_list), len(intensity_list))
+    mz_arr = np.array([float(x) for x in mz_list[:n]], dtype=float)
+    int_arr = np.array([float(x) for x in intensity_list[:n]], dtype=float)
+
+    valid = (mz_arr > 0) & (int_arr >= 0)
+    mz_arr = mz_arr[valid]
+    int_arr = int_arr[valid]
+
+    if len(mz_arr) == 0:
+        return {
+            "rule3_cl_radical_loss": 0,
+            "rule3_cl_radical_loss_score": 0.0,
+            "rule3_loss_type": "none",
+            "rule3_expected_fragment": np.nan,
+            "rule3_observed_fragment": np.nan,
+            "rule3_mass_error": np.nan,
+            "rule3_fragment_intensity": np.nan,
+            "rule3_relative_intensity": np.nan,
+            "rule3_low_intensity_flag": 0,
+            "rule3_35cl_37cl_pair_flag": 0
+        }
+
+    base_peak = float(np.max(int_arr))
+
+    candidates = []
+
+    loss_options = [
+        ("35Cl", CL35_RADICAL_LOSS),
+        ("37Cl", CL37_RADICAL_LOSS),
+        ("2x35Cl", DOUBLE_CL35_RADICAL_LOSS)
+    ]
+
+    for label, loss_mass in loss_options:
+        target_fragment = float(precursor_mz) - loss_mass
+
+        if target_fragment <= 0:
+            continue
+
+        match = find_best_fragment_match(
+            target_fragment=target_fragment,
+            mz_arr=mz_arr,
+            int_arr=int_arr,
+            base_peak=base_peak
+        )
+
+        mass_score = max(0.0, 1.0 - (match["mass_error"] / MZ_TOL))
+
+        intensity_ok = (
+            (match["fragment_intensity"] >= MIN_FRAGMENT_INTENSITY) or
+            (match["relative_intensity"] >= MIN_RELATIVE_INTENSITY)
+        )
+
+        absolute_factor = min(
+            1.0,
+            match["fragment_intensity"] / (MIN_FRAGMENT_INTENSITY * 5)
+        )
+
+        relative_factor = min(
+            1.0,
+            match["relative_intensity"] / MIN_RELATIVE_INTENSITY
+        )
+
+        intensity_factor = max(absolute_factor, relative_factor)
+
+        score = mass_score * intensity_factor
+
+        candidates.append({
+            "loss_type": label,
+            "expected_fragment": target_fragment,
+            "observed_fragment": match["observed_fragment"],
+            "mass_error": match["mass_error"],
+            "fragment_intensity": match["fragment_intensity"],
+            "relative_intensity": match["relative_intensity"],
+            "mass_score": mass_score,
+            "intensity_ok": intensity_ok,
+            "score": score
+        })
+
+    if len(candidates) == 0:
+        return {
+            "rule3_cl_radical_loss": 0,
+            "rule3_cl_radical_loss_score": 0.0,
+            "rule3_loss_type": "none",
+            "rule3_expected_fragment": np.nan,
+            "rule3_observed_fragment": np.nan,
+            "rule3_mass_error": np.nan,
+            "rule3_fragment_intensity": np.nan,
+            "rule3_relative_intensity": np.nan,
+            "rule3_low_intensity_flag": 0,
+            "rule3_35cl_37cl_pair_flag": 0
+        }
+
+    best = max(candidates, key=lambda x: x["score"])
+
+    low_intensity_flag = int(
+        best["mass_error"] <= MZ_TOL and
+        not best["intensity_ok"]
+    )
+
+    positive = int(
+        (best["mass_error"] <= MZ_TOL) and
+        best["intensity_ok"]
+    )
+
+    # Bonus diagnostic:
+    # both 35Cl and 37Cl radical losses present
+    present_35 = any(
+        c["loss_type"] == "35Cl" and
+        c["mass_error"] <= MZ_TOL and
+        c["intensity_ok"]
+        for c in candidates
+    )
+
+    present_37 = any(
+        c["loss_type"] == "37Cl" and
+        c["mass_error"] <= MZ_TOL and
+        c["intensity_ok"]
+        for c in candidates
+    )
+
+    pair_flag = int(present_35 and present_37)
+
+    return {
+        "rule3_cl_radical_loss": positive,
+        "rule3_cl_radical_loss_score": best["score"],
+        "rule3_loss_type": best["loss_type"],
+        "rule3_expected_fragment": best["expected_fragment"],
+        "rule3_observed_fragment": best["observed_fragment"],
+        "rule3_mass_error": best["mass_error"],
+        "rule3_fragment_intensity": best["fragment_intensity"],
+        "rule3_relative_intensity": best["relative_intensity"],
+        "rule3_low_intensity_flag": low_intensity_flag,
+        "rule3_35cl_37cl_pair_flag": pair_flag
+    }
+
+
+# =========================
+# Load data
+# =========================
+df = pd.read_csv(INPUT_CSV)
+
+if MZ_COL not in df.columns:
+    raise ValueError(f"Missing MS2 fragment column: {MZ_COL}")
+
+if INT_COL not in df.columns:
+    raise ValueError(f"Missing MS2 intensity column: {INT_COL}")
+
+if PRECURSOR_COL not in df.columns:
+    raise ValueError(f"Missing precursor column: {PRECURSOR_COL}")
+
+df["_mz_list"] = df[MZ_COL].apply(safe_parse_list)
+df["_intensity_list"] = df[INT_COL].apply(safe_parse_list)
+
+# =========================
+# Apply Rule 3
+# =========================
+results = []
+
+for _, row in df.iterrows():
+    result = rule3_cl_radical_loss(
+        precursor_mz=row[PRECURSOR_COL],
+        mz_list=row["_mz_list"],
+        intensity_list=row["_intensity_list"]
+    )
+    results.append(result)
+
+rule3_df = pd.DataFrame(results)
+
+df_rule3 = pd.concat(
+    [df.reset_index(drop=True), rule3_df.reset_index(drop=True)],
+    axis=1
+)
+
+# =========================
+# Save outputs
+# =========================
+df_rule3.to_csv(OUT_ALL, index=False)
+
+df_pos = df_rule3[df_rule3["rule3_cl_radical_loss"] == 1].copy()
+df_pos.to_csv(OUT_POS, index=False)
+
+print("\nRule 3 summary")
+print("Total features:", len(df_rule3))
+print("Rule 3 Cl radical-loss positives:", len(df_pos))
+print("35Cl positives:", int((df_pos["rule3_loss_type"] == "35Cl").sum()))
+print("37Cl positives:", int((df_pos["rule3_loss_type"] == "37Cl").sum()))
+print("Double 35Cl positives:", int((df_pos["rule3_loss_type"] == "2x35Cl").sum()))
+print("35Cl/37Cl paired diagnostic:", int(df_rule3["rule3_35cl_37cl_pair_flag"].sum()))
+print("Low-intensity near matches:", int(df_rule3["rule3_low_intensity_flag"].sum()))
+print("Mean Rule 3 score:", df_rule3["rule3_cl_radical_loss_score"].mean())
+
+print(f"\nSaved all Rule 3 results to: {OUT_ALL}")
+print(f"Saved Rule 3 positives to: {OUT_POS}")
+
+df_pos.head()
