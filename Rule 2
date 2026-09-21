@@ -1,0 +1,218 @@
+# ============================================================
+# RULE 2 ONLY:
+# HCl NEUTRAL LOSS FROM PRECURSOR IN MS2
+# Checks single HCl and double HCl loss
+# ============================================================
+
+import ast
+import numpy as np
+import pandas as pd
+
+# =========================
+# CONFIG
+# =========================
+INPUT_CSV = "/content/mgf_extracted.csv"
+
+OUT_ALL = "/content/rule2_hcl_loss_all_features_precursor_based.csv"
+OUT_POS = "/content/rule2_hcl_loss_positive_features_precursor_based.csv"
+
+MZ_COL = "mz_values"
+INT_COL = "intensity_values"
+PRECURSOR_COL = "PEPMASS"
+
+HCL_LOSS_1 = 35.9767
+HCL_LOSS_2 = 71.9534
+
+MZ_TOL = 0.01
+
+MIN_FRAGMENT_INTENSITY = 1000
+MIN_RELATIVE_INTENSITY = 0.05
+
+EPS = 1e-12
+
+# =========================
+# Helper functions
+# =========================
+def safe_parse_list(x):
+    if isinstance(x, list):
+        return [float(v) for v in x]
+
+    if pd.isna(x):
+        return []
+
+    s = str(x).strip()
+
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, (list, tuple)):
+            return [float(v) for v in val]
+    except Exception:
+        pass
+
+    try:
+        return [float(v.strip()) for v in s.strip("[]()").split(",") if v.strip()]
+    except Exception:
+        return []
+
+
+def rule2_hcl_precursor_loss(precursor_mz, mz_list, intensity_list):
+    """
+    Rule 2:
+    Positive if MS2 contains precursor - HCl or precursor - 2HCl.
+    """
+
+    if len(mz_list) == 0 or len(intensity_list) == 0:
+        return {
+            "rule2_hcl_loss": 0,
+            "rule2_hcl_loss_score": 0.0,
+            "rule2_hcl_loss_number": 0,
+            "rule2_hcl_expected_fragment": np.nan,
+            "rule2_hcl_observed_fragment": np.nan,
+            "rule2_hcl_mass_error": np.nan,
+            "rule2_hcl_fragment_intensity": np.nan,
+            "rule2_hcl_relative_intensity": np.nan,
+            "rule2_hcl_low_intensity_flag": 0
+        }
+
+    n = min(len(mz_list), len(intensity_list))
+    mz_list = [float(x) for x in mz_list[:n]]
+    intensity_list = [float(x) for x in intensity_list[:n]]
+
+    base_peak = max(intensity_list) if len(intensity_list) > 0 else 0.0
+
+    best = {
+        "loss_number": 0,
+        "expected_fragment": np.nan,
+        "observed_fragment": np.nan,
+        "mass_error": np.inf,
+        "intensity": np.nan,
+        "relative_intensity": np.nan,
+        "mass_score": 0.0,
+        "intensity_ok": False
+    }
+
+    for loss_mass, loss_number in [
+        (HCL_LOSS_1, 1),
+        (HCL_LOSS_2, 2)
+    ]:
+        target_fragment = float(precursor_mz) - loss_mass
+
+        if target_fragment <= 0:
+            continue
+
+        for mz, inten in zip(mz_list, intensity_list):
+            error = abs(mz - target_fragment)
+
+            if error < best["mass_error"]:
+                rel_int = inten / (base_peak + EPS)
+
+                best = {
+                    "loss_number": loss_number,
+                    "expected_fragment": target_fragment,
+                    "observed_fragment": mz,
+                    "mass_error": error,
+                    "intensity": inten,
+                    "relative_intensity": rel_int,
+                    "mass_score": max(0.0, 1.0 - (error / MZ_TOL)),
+                    "intensity_ok": (
+                        (inten >= MIN_FRAGMENT_INTENSITY) or
+                        (rel_int >= MIN_RELATIVE_INTENSITY)
+                    )
+                }
+
+    low_intensity_flag = int(
+        best["mass_error"] <= MZ_TOL and
+        not best["intensity_ok"]
+    )
+
+    intensity_factor = 0.0
+    if np.isfinite(best["intensity"]):
+        absolute_factor = min(
+            1.0,
+            best["intensity"] / (MIN_FRAGMENT_INTENSITY * 5)
+        )
+        relative_factor = min(
+            1.0,
+            best["relative_intensity"] / MIN_RELATIVE_INTENSITY
+        )
+        intensity_factor = max(absolute_factor, relative_factor)
+
+    score = best["mass_score"] * intensity_factor
+
+    positive = int(
+        (best["mass_error"] <= MZ_TOL) and
+        best["intensity_ok"]
+    )
+
+    return {
+        "rule2_hcl_loss": positive,
+        "rule2_hcl_loss_score": score,
+        "rule2_hcl_loss_number": best["loss_number"],
+        "rule2_hcl_expected_fragment": best["expected_fragment"],
+        "rule2_hcl_observed_fragment": best["observed_fragment"],
+        "rule2_hcl_mass_error": best["mass_error"],
+        "rule2_hcl_fragment_intensity": best["intensity"],
+        "rule2_hcl_relative_intensity": best["relative_intensity"],
+        "rule2_hcl_low_intensity_flag": low_intensity_flag
+    }
+
+
+# =========================
+# Load data
+# =========================
+df = pd.read_csv(INPUT_CSV)
+
+if MZ_COL not in df.columns:
+    raise ValueError(f"Missing MS2 fragment column: {MZ_COL}")
+
+if INT_COL not in df.columns:
+    raise ValueError(f"Missing MS2 intensity column: {INT_COL}")
+
+if PRECURSOR_COL not in df.columns:
+    raise ValueError(f"Missing precursor column: {PRECURSOR_COL}")
+
+df["_mz_list"] = df[MZ_COL].apply(safe_parse_list)
+df["_intensity_list"] = df[INT_COL].apply(safe_parse_list)
+
+# =========================
+# Apply Rule 2
+# =========================
+results = []
+
+for _, row in df.iterrows():
+
+    result = rule2_hcl_precursor_loss(
+        precursor_mz=row[PRECURSOR_COL],
+        mz_list=row["_mz_list"],
+        intensity_list=row["_intensity_list"]
+    )
+
+    results.append(result)
+
+rule2_df = pd.DataFrame(results)
+
+df_rule2 = pd.concat(
+    [df.reset_index(drop=True), rule2_df.reset_index(drop=True)],
+    axis=1
+)
+
+# =========================
+# Save outputs
+# =========================
+df_rule2.to_csv(OUT_ALL, index=False)
+
+df_pos = df_rule2[df_rule2["rule2_hcl_loss"] == 1].copy()
+df_pos.to_csv(OUT_POS, index=False)
+
+print("\nRule 2 summary")
+print("Total features:", len(df_rule2))
+print("Rule 2 HCl-loss positives:", len(df_pos))
+print("Single HCl positives:", int((df_pos["rule2_hcl_loss_number"] == 1).sum()))
+print("Double HCl positives:", int((df_pos["rule2_hcl_loss_number"] == 2).sum()))
+print("Low-intensity near matches:", int(df_rule2["rule2_hcl_low_intensity_flag"].sum()))
+print("Mean Rule 2 score:", df_rule2["rule2_hcl_loss_score"].mean())
+
+print(f"\nSaved all Rule 2 results to: {OUT_ALL}")
+print(f"Saved Rule 2 positives to: {OUT_POS}")
+
+df_pos.head()
