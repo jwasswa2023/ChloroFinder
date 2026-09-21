@@ -1,0 +1,362 @@
+# ============================================================
+# RULE 1: MS1 chlorine isotope rule with blank/control subtraction
+# ============================================================
+
+!pip install -q pyteomics psims
+
+#from google.colab import drive
+#drive.mount("/content/drive")
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+from pyteomics import mzml
+
+# =========================
+# CONFIG
+# =========================
+INPUT_CSV = "/content/mgf_extracted.csv"
+MZML_FOLDER = "/content/drive/MyDrive/ESTER_MZML"
+
+OUT_ALL = "/content/rule1_ms1_all_features_background_subtracted.csv"
+OUT_POS = "/content/rule1_ms1_positive_features_background_subtracted.csv"
+
+RT_COL = "RTINSECONDS"
+PRECURSOR_COL = "PEPMASS"
+FILENAME_COL = "FILENAME"
+
+MZ_TOL = 0.01
+RT_WINDOW_SECONDS = 5.0
+MIN_M_INTENSITY = 1000
+
+BACKGROUND_FOLD_CHANGE = 5.0
+MIN_SAMPLE_MINUS_BACKGROUND = 1000
+
+CL_M2_SHIFT = 1.99705
+CL_M4_SHIFT = 3.99410
+
+EXPECTED_M2 = {1: 0.32, 2: 0.60, 3: 0.90}
+EXPECTED_M4 = {1: 0.00, 2: 0.10, 3: 0.30}
+
+RATIO_TOL = 0.12
+M4_TOL = 0.15
+EPS = 1e-12
+
+SAMPLE_PREFIXES = [
+    "TPU_Ester_Chloro",
+    "TPU_Ester_Hydro"
+]
+
+BACKGROUND_FILES = [
+    "Control_Chloro_1.mzML",
+    "Control_Chloro_2.mzML",
+    "Control_Chloro_3.mzML",
+    "Control_Hydrolysis_1.mzML",
+    "Control_Hydrolysis_2.mzML",
+    "Control_Hydrolysis_3.mzML",
+    "Filter_Blank_1.mzML",
+    "Filter_Blank_2.mzML",
+    "Filter_Blank_3.mzML"
+]
+
+# =========================
+# Find mzML files
+# =========================
+mzml_files = sorted(
+    glob.glob(os.path.join(MZML_FOLDER, "*.mzML")) +
+    glob.glob(os.path.join(MZML_FOLDER, "*.mzml"))
+)
+
+MZML_FILE_MAP = {os.path.basename(f): f for f in mzml_files}
+
+print("mzML files found:", len(MZML_FILE_MAP))
+for f in MZML_FILE_MAP:
+    print(f)
+
+# =========================
+# Helpers
+# =========================
+def split_filenames(x):
+    if pd.isna(x):
+        return []
+    return [os.path.basename(v.strip()) for v in str(x).split(";") if v.strip()]
+
+
+def is_sample_file(fname):
+    return any(fname.startswith(prefix) for prefix in SAMPLE_PREFIXES)
+
+
+def build_ms1_cache(mzml_path):
+    cache = []
+
+    with mzml.MzML(mzml_path) as reader:
+        for spec in reader:
+            if spec.get("ms level") == 1:
+                scan = spec["scanList"]["scan"][0]
+                rt = scan.get("scan start time", np.nan)
+                unit = scan.get("scan start time unit", "").lower()
+
+                if "second" in unit:
+                    rt_seconds = float(rt)
+                else:
+                    rt_seconds = float(rt) * 60.0
+
+                mz_array = np.asarray(spec["m/z array"], dtype=float)
+                int_array = np.asarray(spec["intensity array"], dtype=float)
+
+                cache.append((rt_seconds, mz_array, int_array))
+
+    return cache
+
+
+def integrate_peak(mz_array, int_array, target_mz, tol=MZ_TOL):
+    mask = (mz_array >= target_mz - tol) & (mz_array <= target_mz + tol)
+    return float(np.sum(int_array[mask])) if np.any(mask) else 0.0
+
+
+def integrate_peak_rt_window(ms1_cache, rt_seconds, target_mz):
+    vals = []
+
+    for scan_rt, mz_array, int_array in ms1_cache:
+        if abs(scan_rt - rt_seconds) <= RT_WINDOW_SECONDS:
+            vals.append(integrate_peak(mz_array, int_array, target_mz))
+
+    if len(vals) == 0:
+        return 0.0, 0
+
+    return float(np.mean(vals)), len(vals)
+
+
+def get_ms1_cache(fname, cache_dict):
+    if fname not in cache_dict:
+        print("Reading MS1:", fname)
+        cache_dict[fname] = build_ms1_cache(MZML_FILE_MAP[fname])
+        print("  MS1 scans:", len(cache_dict[fname]))
+    return cache_dict[fname]
+
+
+def calculate_rule1_from_cache(ms1_cache, rt_seconds, precursor_mz):
+    M_int, n_scans = integrate_peak_rt_window(ms1_cache, rt_seconds, precursor_mz)
+    M2_int, _ = integrate_peak_rt_window(ms1_cache, rt_seconds, precursor_mz + CL_M2_SHIFT)
+    M4_int, _ = integrate_peak_rt_window(ms1_cache, rt_seconds, precursor_mz + CL_M4_SHIFT)
+
+    if M_int < MIN_M_INTENSITY:
+        return {
+            "positive": 0,
+            "score": 0.0,
+            "best_n_cl": 0,
+            "M_intensity": M_int,
+            "M2_intensity": M2_int,
+            "M4_intensity": M4_int,
+            "M2_M_ratio": 0.0,
+            "M4_M_ratio": 0.0,
+            "M2_error": np.nan,
+            "M4_error": np.nan,
+            "n_scans": n_scans,
+            "low_M_flag": 1
+        }
+
+    M2_ratio = M2_int / (M_int + EPS)
+    M4_ratio = M4_int / (M_int + EPS)
+
+    best_n = 0
+    best_M2_error = np.inf
+    best_M4_error = np.inf
+    best_total_error = np.inf
+
+    for n_cl in EXPECTED_M2:
+        M2_error = abs(M2_ratio - EXPECTED_M2[n_cl])
+        M4_error = abs(M4_ratio - EXPECTED_M4[n_cl])
+
+        if n_cl == 1:
+            total_error = M2_error
+        else:
+            total_error = M2_error + 0.5 * M4_error
+
+        if total_error < best_total_error:
+            best_total_error = total_error
+            best_n = n_cl
+            best_M2_error = M2_error
+            best_M4_error = M4_error
+
+    score = max(0.0, 1.0 - (best_M2_error / RATIO_TOL))
+    positive = int(best_M2_error <= RATIO_TOL)
+
+    if best_n >= 2 and best_M4_error > M4_TOL:
+        positive = 0
+        score = min(score, 0.49)
+
+    return {
+        "positive": positive,
+        "score": score,
+        "best_n_cl": best_n,
+        "M_intensity": M_int,
+        "M2_intensity": M2_int,
+        "M4_intensity": M4_int,
+        "M2_M_ratio": M2_ratio,
+        "M4_M_ratio": M4_ratio,
+        "M2_error": best_M2_error,
+        "M4_error": best_M4_error,
+        "n_scans": n_scans,
+        "low_M_flag": 0
+    }
+
+
+# =========================
+# Load features
+# =========================
+df = pd.read_csv(INPUT_CSV)
+
+df["_file_list"] = df[FILENAME_COL].apply(split_filenames)
+
+if df[RT_COL].max() < 100:
+    df["_rt_seconds"] = df[RT_COL].astype(float) * 60.0
+else:
+    df["_rt_seconds"] = df[RT_COL].astype(float)
+
+ms1_cache_by_file = {}
+results = []
+
+# =========================
+# Apply Rule 1 with background subtraction
+# =========================
+for _, row in df.iterrows():
+
+    rt_seconds = float(row["_rt_seconds"])
+    precursor_mz = float(row[PRECURSOR_COL])
+
+    files_in_feature = row["_file_list"]
+
+    sample_files = [
+        f for f in files_in_feature
+        if is_sample_file(f) and f in MZML_FILE_MAP
+    ]
+
+    # If no sample file is listed, do not keep it
+    if len(sample_files) == 0:
+        results.append({
+            "rule1_ms1_chlorine_isotope": 0,
+            "rule1_ms1_score": 0.0,
+            "rule1_background_subtracted": 0,
+            "rule1_final_keep": 0,
+            "sample_files_used": "",
+            "best_sample_file": "",
+            "background_files_used": ";".join(BACKGROUND_FILES),
+            "sample_M_intensity": np.nan,
+            "background_M_intensity_max": np.nan,
+            "sample_minus_background": np.nan,
+            "sample_to_background_ratio": np.nan,
+            "best_matching_n_chlorines": 0,
+            "M_plus_2_over_M_ratio": np.nan,
+            "M_plus_4_over_M_ratio": np.nan,
+            "status": "no_sample_file"
+        })
+        continue
+
+    # ---------- sample signal ----------
+    sample_results = []
+
+    for fname in sample_files:
+        ms1_cache = get_ms1_cache(fname, ms1_cache_by_file)
+
+        r = calculate_rule1_from_cache(
+            ms1_cache=ms1_cache,
+            rt_seconds=rt_seconds,
+            precursor_mz=precursor_mz
+        )
+
+        r["file"] = fname
+        sample_results.append(r)
+
+    best_sample = max(sample_results, key=lambda x: x["score"])
+
+    # ---------- background signal ----------
+    background_M_values = []
+
+    for bg_file in BACKGROUND_FILES:
+        if bg_file not in MZML_FILE_MAP:
+            continue
+
+        bg_cache = get_ms1_cache(bg_file, ms1_cache_by_file)
+
+        bg_M, _ = integrate_peak_rt_window(
+            bg_cache,
+            rt_seconds,
+            precursor_mz
+        )
+
+        background_M_values.append(bg_M)
+
+    if len(background_M_values) == 0:
+        bg_max = 0.0
+    else:
+        bg_max = float(np.max(background_M_values))
+
+    sample_M = best_sample["M_intensity"]
+
+    sample_minus_bg = sample_M - bg_max
+    sample_bg_ratio = sample_M / (bg_max + EPS)
+
+    background_subtracted = int(
+        (sample_M >= MIN_M_INTENSITY) and
+        (sample_minus_bg >= MIN_SAMPLE_MINUS_BACKGROUND) and
+        (sample_bg_ratio >= BACKGROUND_FOLD_CHANGE)
+    )
+
+    final_keep = int(
+        (best_sample["positive"] == 1) and
+        (background_subtracted == 1)
+    )
+
+    results.append({
+        "rule1_ms1_chlorine_isotope": best_sample["positive"],
+        "rule1_ms1_score": best_sample["score"],
+        "rule1_background_subtracted": background_subtracted,
+        "rule1_final_keep": final_keep,
+        "sample_files_used": ";".join(sample_files),
+        "best_sample_file": best_sample["file"],
+        "background_files_used": ";".join(BACKGROUND_FILES),
+        "sample_M_intensity": sample_M,
+        "background_M_intensity_max": bg_max,
+        "sample_minus_background": sample_minus_bg,
+        "sample_to_background_ratio": sample_bg_ratio,
+        "best_matching_n_chlorines": best_sample["best_n_cl"],
+        "M_plus_2_intensity": best_sample["M2_intensity"],
+        "M_plus_4_intensity": best_sample["M4_intensity"],
+        "M_plus_2_over_M_ratio": best_sample["M2_M_ratio"],
+        "M_plus_4_over_M_ratio": best_sample["M4_M_ratio"],
+        "M2_ratio_error": best_sample["M2_error"],
+        "M4_ratio_error": best_sample["M4_error"],
+        "n_ms1_scans_used": best_sample["n_scans"],
+        "low_M_intensity_flag": best_sample["low_M_flag"],
+        "status": "processed"
+    })
+
+# =========================
+# Save outputs
+# =========================
+rule_df = pd.DataFrame(results)
+
+df_out = pd.concat(
+    [df.drop(columns=["_file_list"], errors="ignore").reset_index(drop=True),
+     rule_df.reset_index(drop=True)],
+    axis=1
+)
+
+df_out.to_csv(OUT_ALL, index=False)
+
+df_pos = df_out[df_out["rule1_final_keep"] == 1].copy()
+df_pos.to_csv(OUT_POS, index=False)
+
+print("\nRule 1 with background subtraction summary")
+print("Total features:", len(df_out))
+print("Rule 1 isotope positives before subtraction:", int(df_out["rule1_ms1_chlorine_isotope"].sum()))
+print("Features passing background subtraction:", int(df_out["rule1_background_subtracted"].sum()))
+print("Final Rule 1 positives after subtraction:", int(df_out["rule1_final_keep"].sum()))
+print("Mean Rule 1 score:", df_out["rule1_ms1_score"].mean())
+
+print(f"\nSaved all features to: {OUT_ALL}")
+print(f"Saved final Rule 1 positives to: {OUT_POS}")
+
+df_pos.head()
