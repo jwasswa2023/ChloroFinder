@@ -1,0 +1,2550 @@
+# ============================================================
+# OPTION B — CODE 1
+# Integrated ChloroFinder + MS1 isotope scoring
+#
+# Rule4 is retained as independent supporting MS2 evidence
+# but does NOT contribute to the CombinedScore.
+#
+# Inputs:
+#   1. trained ChloroFinder .pkl
+#   2. experimental MGF feature table
+#   3. mzML files
+#   4. Rule4 all-features file for independent MS2 Cl-pair evidence
+#
+# Outputs:
+#   prioritized candidate features using:
+#   - ChloroFinder MS2 probability
+#   - MS1 chlorine isotope score after background subtraction
+#   - Rule4 MS2 chlorine fragment-pair evidence (independent)
+#
+#   CombinedScore = 0.60*ML + 0.40*MS1
+# ============================================================
+
+!pip install -q pyteomics psims
+
+import os
+import ast
+import glob
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from itertools import combinations
+from scipy.sparse import hstack, csr_matrix
+from pyteomics import mzml
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+MGF_CSV = "/content/mgf_extracted.csv"
+MODEL_PATH = "/content/chlorofinder_massbank.pkl"
+MZML_FOLDER = "/content/drive/MyDrive/ESTER_MZML"
+
+# Rule4 retained ONLY as independent supporting evidence
+RULE4_ALL_FILE = "/content/rule4_ms2_cl_fragment_pair_all_features_BALANCED.csv"
+
+OUT_ALL = "/content/OptionB_Code1_ChloroFinder_MS1_all_features.csv"
+OUT_PRIORITY = "/content/OptionB_Code1_prioritized_features.csv"
+OUT_HIGH_CONF = "/content/OptionB_Code1_high_confidence_features.csv"
+OUT_SUMMARY = "/content/OptionB_Code1_summary.csv"
+
+FIG_DIR = "/content/OptionB_Code1_Figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+MZ_COL = "mz_values"
+RT_COL = "RTINSECONDS"
+PRECURSOR_COL = "PEPMASS"
+FILENAME_COL = "FILENAME"
+
+# ChloroFinder probability thresholds
+CF_BROAD_THRESHOLD = 0.40
+CF_DEFAULT_THRESHOLD = 0.50
+CF_HIGH_THRESHOLD = 0.60
+
+# CombinedScore threshold
+COMBINED_SCORE_THRESHOLD = 0.60
+
+# MS1 processing
+MZ_TOL = 0.01
+RT_WINDOW_SECONDS = 5.0
+MIN_M_INTENSITY = 1000
+
+# Background requirements
+BACKGROUND_FOLD_CHANGE = 5.0
+MIN_SAMPLE_MINUS_BACKGROUND = 1000
+
+# Chlorine isotope spacing
+CL_M2_SHIFT = 1.99705
+CL_M4_SHIFT = 3.99410
+
+# Approximate expected isotope ratios
+EXPECTED_M2 = {
+    1: 0.32,
+    2: 0.60,
+    3: 0.90
+}
+
+EXPECTED_M4 = {
+    1: 0.00,
+    2: 0.10,
+    3: 0.30
+}
+
+RATIO_TOL = 0.12
+M4_TOL = 0.15
+EPS = 1e-12
+
+SAMPLE_PREFIXES = [
+    "TPU_Ester_Chloro",
+    "TPU_Ester_Hydro"
+]
+
+BACKGROUND_FILES = [
+    "Control_Chloro_1.mzML",
+    "Control_Chloro_2.mzML",
+    "Control_Chloro_3.mzML",
+    "Control_Hydrolysis_1.mzML",
+    "Control_Hydrolysis_2.mzML",
+    "Control_Hydrolysis_3.mzML",
+    "Filter_Blank_1.mzML",
+    "Filter_Blank_2.mzML",
+    "Filter_Blank_3.mzML"
+]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_parse_list(x):
+
+    if isinstance(x, list):
+        return [float(v) for v in x]
+
+    if pd.isna(x):
+        return []
+
+    s = str(x).strip()
+
+    try:
+        val = ast.literal_eval(s)
+
+        if isinstance(val, (list, tuple, np.ndarray)):
+            return [float(v) for v in val]
+
+    except Exception:
+        pass
+
+    for sep in [";", "|", ":"]:
+        s = s.replace(sep, ",")
+
+    try:
+        return [
+            float(v.strip())
+            for v in s.strip("[]()").split(",")
+            if v.strip()
+        ]
+
+    except Exception:
+        return []
+
+
+def round_unique(values, dp):
+
+    out = []
+    seen = set()
+
+    for v in values:
+
+        try:
+            rv = round(float(v), dp)
+
+            if rv > 0 and rv not in seen:
+                seen.add(rv)
+                out.append(rv)
+
+        except Exception:
+            continue
+
+    return sorted(out)
+
+
+def compute_delta_mz_list(
+    frag_list,
+    round_dp=3,
+    min_delta=0.001
+):
+
+    if len(frag_list) < 2:
+        return []
+
+    frags = sorted(
+        set(float(f) for f in frag_list)
+    )
+
+    deltas = []
+
+    for a, b in combinations(frags, 2):
+
+        d = abs(b - a)
+
+        if d >= min_delta:
+            deltas.append(
+                round(d, round_dp)
+            )
+
+    return sorted(set(deltas))
+
+
+def split_filenames(x):
+
+    if pd.isna(x):
+        return []
+
+    return [
+        os.path.basename(v.strip())
+        for v in str(x).split(";")
+        if v.strip()
+    ]
+
+
+def is_sample_file(fname):
+
+    return any(
+        fname.startswith(prefix)
+        for prefix in SAMPLE_PREFIXES
+    )
+
+
+def make_feature_id(df):
+
+    return (
+        df[PRECURSOR_COL]
+        .round(4)
+        .astype(str)
+        + "_"
+        + df[RT_COL]
+        .round(1)
+        .astype(str)
+    )
+
+
+def find_score_col(df, possible_names):
+
+    for c in possible_names:
+
+        if c in df.columns:
+            return c
+
+    raise ValueError(
+        f"Could not find score column. "
+        f"Tried: {possible_names}\n"
+        f"Available columns: {list(df.columns)}"
+    )
+
+
+# ============================================================
+# mzML HELPERS
+# ============================================================
+
+def build_ms1_cache(mzml_path):
+
+    cache = []
+
+    with mzml.MzML(mzml_path) as reader:
+
+        for spec in reader:
+
+            if spec.get("ms level") == 1:
+
+                scan = spec["scanList"]["scan"][0]
+
+                rt = scan.get(
+                    "scan start time",
+                    np.nan
+                )
+
+                unit = scan.get(
+                    "scan start time unit",
+                    ""
+                ).lower()
+
+                if "second" in unit:
+                    rt_seconds = float(rt)
+
+                else:
+                    rt_seconds = float(rt) * 60.0
+
+                mz_array = np.asarray(
+                    spec["m/z array"],
+                    dtype=float
+                )
+
+                int_array = np.asarray(
+                    spec["intensity array"],
+                    dtype=float
+                )
+
+                cache.append(
+                    (
+                        rt_seconds,
+                        mz_array,
+                        int_array
+                    )
+                )
+
+    return cache
+
+
+def integrate_peak(
+    mz_array,
+    int_array,
+    target_mz,
+    tol=MZ_TOL
+):
+
+    mask = (
+        (mz_array >= target_mz - tol)
+        &
+        (mz_array <= target_mz + tol)
+    )
+
+    if np.any(mask):
+        return float(
+            np.sum(int_array[mask])
+        )
+
+    return 0.0
+
+
+def integrate_peak_rt_window(
+    ms1_cache,
+    rt_seconds,
+    target_mz
+):
+
+    vals = []
+
+    for scan_rt, mz_array, int_array in ms1_cache:
+
+        if abs(scan_rt - rt_seconds) <= RT_WINDOW_SECONDS:
+
+            vals.append(
+                integrate_peak(
+                    mz_array,
+                    int_array,
+                    target_mz
+                )
+            )
+
+    if len(vals) == 0:
+        return 0.0, 0
+
+    return (
+        float(np.mean(vals)),
+        len(vals)
+    )
+
+
+def calculate_ms1_chlorine_isotope(
+    ms1_cache,
+    rt_seconds,
+    precursor_mz
+):
+
+    # -----------------------------
+    # Integrate M
+    # -----------------------------
+
+    M_int, n_scans = integrate_peak_rt_window(
+        ms1_cache,
+        rt_seconds,
+        precursor_mz
+    )
+
+    # -----------------------------
+    # Integrate M+2
+    # -----------------------------
+
+    M2_int, _ = integrate_peak_rt_window(
+        ms1_cache,
+        rt_seconds,
+        precursor_mz + CL_M2_SHIFT
+    )
+
+    # -----------------------------
+    # Integrate M+4
+    # -----------------------------
+
+    M4_int, _ = integrate_peak_rt_window(
+        ms1_cache,
+        rt_seconds,
+        precursor_mz + CL_M4_SHIFT
+    )
+
+    # -----------------------------
+    # Minimum M intensity check
+    # -----------------------------
+
+    if M_int < MIN_M_INTENSITY:
+
+        return {
+            "ms1_isotope_positive_raw": 0,
+            "ms1_isotope_score": 0.0,
+            "best_matching_n_chlorines": 0,
+            "M_intensity": M_int,
+            "M_plus_2_intensity": M2_int,
+            "M_plus_4_intensity": M4_int,
+            "M_plus_2_over_M_ratio": 0.0,
+            "M_plus_4_over_M_ratio": 0.0,
+            "M2_ratio_error": np.nan,
+            "M4_ratio_error": np.nan,
+            "n_ms1_scans_used": n_scans,
+            "low_M_intensity_flag": 1
+        }
+
+    # -----------------------------
+    # Calculate isotope ratios
+    # -----------------------------
+
+    M2_ratio = M2_int / (
+        M_int + EPS
+    )
+
+    M4_ratio = M4_int / (
+        M_int + EPS
+    )
+
+    best_n = 0
+    best_M2_error = np.inf
+    best_M4_error = np.inf
+    best_total_error = np.inf
+
+    # -----------------------------
+    # Compare with expected
+    # chlorine isotope patterns
+    # -----------------------------
+
+    for n_cl in EXPECTED_M2:
+
+        M2_error = abs(
+            M2_ratio
+            - EXPECTED_M2[n_cl]
+        )
+
+        M4_error = abs(
+            M4_ratio
+            - EXPECTED_M4[n_cl]
+        )
+
+        if n_cl == 1:
+
+            total_error = M2_error
+
+        else:
+
+            total_error = (
+                M2_error
+                + 0.5 * M4_error
+            )
+
+        if total_error < best_total_error:
+
+            best_total_error = total_error
+            best_n = n_cl
+            best_M2_error = M2_error
+            best_M4_error = M4_error
+
+    # -----------------------------
+    # Convert M+2 agreement into
+    # continuous isotope score
+    # -----------------------------
+
+    score = max(
+        0.0,
+        1.0 - (
+            best_M2_error
+            / RATIO_TOL
+        )
+    )
+
+    positive = int(
+        best_M2_error <= RATIO_TOL
+    )
+
+    # Require M+4 agreement
+    # when ≥2 chlorine atoms expected
+    if (
+        best_n >= 2
+        and
+        best_M4_error > M4_TOL
+    ):
+
+        positive = 0
+
+        score = min(
+            score,
+            0.49
+        )
+
+    return {
+
+        "ms1_isotope_positive_raw":
+            positive,
+
+        "ms1_isotope_score":
+            score,
+
+        "best_matching_n_chlorines":
+            best_n,
+
+        "M_intensity":
+            M_int,
+
+        "M_plus_2_intensity":
+            M2_int,
+
+        "M_plus_4_intensity":
+            M4_int,
+
+        "M_plus_2_over_M_ratio":
+            M2_ratio,
+
+        "M_plus_4_over_M_ratio":
+            M4_ratio,
+
+        "M2_ratio_error":
+            best_M2_error,
+
+        "M4_ratio_error":
+            best_M4_error,
+
+        "n_ms1_scans_used":
+            n_scans,
+
+        "low_M_intensity_flag":
+            0
+    }
+
+
+# ============================================================
+# FIND mzML FILES
+# ============================================================
+
+mzml_files = sorted(
+
+    glob.glob(
+        os.path.join(
+            MZML_FOLDER,
+            "*.mzML"
+        )
+    )
+
+    +
+
+    glob.glob(
+        os.path.join(
+            MZML_FOLDER,
+            "*.mzml"
+        )
+    )
+)
+
+MZML_FILE_MAP = {
+
+    os.path.basename(f): f
+
+    for f in mzml_files
+}
+
+print(
+    "mzML files found:",
+    len(MZML_FILE_MAP)
+)
+
+for f in MZML_FILE_MAP:
+    print(f)
+
+
+# ============================================================
+# LOAD CHLOROFINDER MODEL
+# ============================================================
+
+bundle = joblib.load(
+    MODEL_PATH
+)
+
+model = bundle["model"]
+mlb_frag = bundle["mlb_frag"]
+mlb_delta = bundle["mlb_delta"]
+
+ROUND_DP = bundle.get(
+    "round_dp",
+    3
+)
+
+print(
+    "\nLoaded ChloroFinder model:",
+    MODEL_PATH
+)
+
+print(
+    "ROUND_DP:",
+    ROUND_DP
+)
+
+
+# ============================================================
+# LOAD MGF FEATURES
+# ============================================================
+
+df = pd.read_csv(
+    MGF_CSV
+)
+
+required_cols = [
+
+    MZ_COL,
+    RT_COL,
+    PRECURSOR_COL,
+    FILENAME_COL
+
+]
+
+missing = [
+
+    c
+    for c in required_cols
+    if c not in df.columns
+
+]
+
+if missing:
+
+    raise ValueError(
+        f"Missing required columns "
+        f"in MGF CSV: {missing}"
+    )
+
+
+# Feature identifier
+df["FeatureID"] = make_feature_id(
+    df
+)
+
+# Parse filenames
+df["_file_list"] = (
+    df[FILENAME_COL]
+    .apply(split_filenames)
+)
+
+
+# Convert RT to seconds if necessary
+if df[RT_COL].max() < 100:
+
+    df["_rt_seconds"] = (
+        df[RT_COL]
+        .astype(float)
+        * 60.0
+    )
+
+else:
+
+    df["_rt_seconds"] = (
+        df[RT_COL]
+        .astype(float)
+    )
+
+
+# ============================================================
+# APPLY CHLOROFINDER
+# ============================================================
+
+df["_mz_list"] = (
+    df[MZ_COL]
+    .apply(safe_parse_list)
+)
+
+df["frag_list_model"] = (
+    df["_mz_list"]
+    .apply(
+        lambda xs:
+        round_unique(
+            xs,
+            ROUND_DP
+        )
+    )
+)
+
+df["delta_list_model"] = (
+    df["frag_list_model"]
+    .apply(
+        lambda xs:
+        compute_delta_mz_list(
+            xs,
+            round_dp=ROUND_DP
+        )
+    )
+)
+
+
+# -----------------------------
+# Fragment feature matrix
+# -----------------------------
+
+X_frag = csr_matrix(
+
+    mlb_frag.transform(
+        df["frag_list_model"]
+    ),
+
+    dtype=np.float32
+)
+
+
+# -----------------------------
+# Delta-m/z feature matrix
+# -----------------------------
+
+X_delta = csr_matrix(
+
+    mlb_delta.transform(
+        df["delta_list_model"]
+    ),
+
+    dtype=np.float32
+)
+
+
+# -----------------------------
+# Combine ML input matrices
+# -----------------------------
+
+X = hstack(
+    [
+        X_frag,
+        X_delta
+    ],
+    format="csr"
+).astype(
+    np.float32
+)
+
+
+# -----------------------------
+# ML probability
+# -----------------------------
+
+df["ChloroFinder_probability"] = (
+    model.predict_proba(X)[:, 1]
+)
+
+
+# -----------------------------
+# Threshold flags
+# -----------------------------
+
+df["ChloroFinder_broad"] = (
+    df["ChloroFinder_probability"]
+    >= CF_BROAD_THRESHOLD
+).astype(int)
+
+df["ChloroFinder_default"] = (
+    df["ChloroFinder_probability"]
+    >= CF_DEFAULT_THRESHOLD
+).astype(int)
+
+df["ChloroFinder_high"] = (
+    df["ChloroFinder_probability"]
+    >= CF_HIGH_THRESHOLD
+).astype(int)
+
+
+# -----------------------------
+# Vocabulary coverage
+# -----------------------------
+
+frag_vocab = set(
+    mlb_frag.classes_
+)
+
+delta_vocab = set(
+    mlb_delta.classes_
+)
+
+df["n_model_frag_matches"] = (
+    df["frag_list_model"]
+    .apply(
+        lambda xs:
+        len(
+            set(xs)
+            .intersection(
+                frag_vocab
+            )
+        )
+    )
+)
+
+df["n_model_delta_matches"] = (
+    df["delta_list_model"]
+    .apply(
+        lambda xs:
+        len(
+            set(xs)
+            .intersection(
+                delta_vocab
+            )
+        )
+    )
+)
+
+
+print(
+    "\nChloroFinder summary"
+)
+
+print(
+    "Total features:",
+    len(df)
+)
+
+print(
+    "CF >=0.40:",
+    int(
+        df[
+            "ChloroFinder_broad"
+        ].sum()
+    )
+)
+
+print(
+    "CF >=0.50:",
+    int(
+        df[
+            "ChloroFinder_default"
+        ].sum()
+    )
+)
+
+print(
+    "CF >=0.60:",
+    int(
+        df[
+            "ChloroFinder_high"
+        ].sum()
+    )
+)
+
+print(
+    "Mean fragment matches:",
+    np.mean(
+        df[
+            "n_model_frag_matches"
+        ]
+    )
+)
+
+print(
+    "Median fragment matches:",
+    np.median(
+        df[
+            "n_model_frag_matches"
+        ]
+    )
+)
+
+
+# ============================================================
+# APPLY MS1 ISOTOPE EVIDENCE
+# ============================================================
+
+ms1_cache_by_file = {}
+
+
+def get_ms1_cache(fname):
+
+    if fname not in ms1_cache_by_file:
+
+        if fname not in MZML_FILE_MAP:
+            return None
+
+        print(
+            "Reading MS1:",
+            fname
+        )
+
+        ms1_cache_by_file[fname] = (
+            build_ms1_cache(
+                MZML_FILE_MAP[fname]
+            )
+        )
+
+        print(
+            "  MS1 scans:",
+            len(
+                ms1_cache_by_file[
+                    fname
+                ]
+            )
+        )
+
+    return ms1_cache_by_file[
+        fname
+    ]
+
+
+results = []
+
+
+for _, row in df.iterrows():
+
+    rt_seconds = float(
+        row["_rt_seconds"]
+    )
+
+    precursor_mz = float(
+        row[PRECURSOR_COL]
+    )
+
+    files_in_feature = (
+        row["_file_list"]
+    )
+
+    sample_files = [
+
+        f
+        for f in files_in_feature
+
+        if (
+            is_sample_file(f)
+            and
+            f in MZML_FILE_MAP
+        )
+
+    ]
+
+    # -----------------------------
+    # No sample file
+    # -----------------------------
+
+    if len(sample_files) == 0:
+
+        results.append({
+
+            "ms1_isotope_positive_raw": 0,
+            "ms1_isotope_score": 0.0,
+            "ms1_background_subtracted": 0,
+            "ms1_final_keep": 0,
+
+            "best_sample_file": "",
+            "sample_files_used": "",
+            "background_files_used":
+                ";".join(
+                    BACKGROUND_FILES
+                ),
+
+            "sample_M_intensity": np.nan,
+            "background_M_intensity_max": np.nan,
+            "sample_minus_background": np.nan,
+            "sample_to_background_ratio": np.nan,
+
+            "best_matching_n_chlorines": 0,
+
+            "M_plus_2_intensity": np.nan,
+            "M_plus_4_intensity": np.nan,
+
+            "M_plus_2_over_M_ratio": np.nan,
+            "M_plus_4_over_M_ratio": np.nan,
+
+            "M2_ratio_error": np.nan,
+            "M4_ratio_error": np.nan,
+
+            "n_ms1_scans_used": 0,
+            "low_M_intensity_flag": 1,
+
+            "ms1_status":
+                "no_sample_file"
+
+        })
+
+        continue
+
+
+    # -----------------------------
+    # Process each sample file
+    # -----------------------------
+
+    sample_results = []
+
+    for fname in sample_files:
+
+        cache = get_ms1_cache(
+            fname
+        )
+
+        if cache is None:
+            continue
+
+        r = calculate_ms1_chlorine_isotope(
+
+            ms1_cache=cache,
+            rt_seconds=rt_seconds,
+            precursor_mz=precursor_mz
+
+        )
+
+        r["file"] = fname
+
+        sample_results.append(
+            r
+        )
+
+
+    # -----------------------------
+    # No usable MS1 cache
+    # -----------------------------
+
+    if len(sample_results) == 0:
+
+        results.append({
+
+            "ms1_isotope_positive_raw": 0,
+            "ms1_isotope_score": 0.0,
+            "ms1_background_subtracted": 0,
+            "ms1_final_keep": 0,
+
+            "best_sample_file": "",
+            "sample_files_used":
+                ";".join(
+                    sample_files
+                ),
+
+            "background_files_used":
+                ";".join(
+                    BACKGROUND_FILES
+                ),
+
+            "sample_M_intensity": np.nan,
+            "background_M_intensity_max": np.nan,
+            "sample_minus_background": np.nan,
+            "sample_to_background_ratio": np.nan,
+
+            "best_matching_n_chlorines": 0,
+
+            "M_plus_2_intensity": np.nan,
+            "M_plus_4_intensity": np.nan,
+
+            "M_plus_2_over_M_ratio": np.nan,
+            "M_plus_4_over_M_ratio": np.nan,
+
+            "M2_ratio_error": np.nan,
+            "M4_ratio_error": np.nan,
+
+            "n_ms1_scans_used": 0,
+            "low_M_intensity_flag": 1,
+
+            "ms1_status":
+                "missing_sample_cache"
+
+        })
+
+        continue
+
+
+    # -----------------------------
+    # Select best MS1 isotope match
+    # -----------------------------
+
+    best_sample = max(
+
+        sample_results,
+
+        key=lambda x:
+        x["ms1_isotope_score"]
+
+    )
+
+
+    # -----------------------------
+    # Background intensities
+    # -----------------------------
+
+    background_M_values = []
+
+    for bg_file in BACKGROUND_FILES:
+
+        bg_cache = get_ms1_cache(
+            bg_file
+        )
+
+        if bg_cache is None:
+            continue
+
+        bg_M, _ = (
+            integrate_peak_rt_window(
+
+                bg_cache,
+                rt_seconds,
+                precursor_mz
+
+            )
+        )
+
+        background_M_values.append(
+            bg_M
+        )
+
+
+    if background_M_values:
+
+        bg_max = float(
+            np.max(
+                background_M_values
+            )
+        )
+
+    else:
+
+        bg_max = 0.0
+
+
+    sample_M = (
+        best_sample[
+            "M_intensity"
+        ]
+    )
+
+    sample_minus_bg = (
+        sample_M
+        - bg_max
+    )
+
+    sample_bg_ratio = (
+        sample_M
+        /
+        (
+            bg_max
+            + EPS
+        )
+    )
+
+
+    # -----------------------------
+    # Background-subtraction test
+    # -----------------------------
+
+    background_subtracted = int(
+
+        (
+            sample_M
+            >= MIN_M_INTENSITY
+        )
+
+        and
+
+        (
+            sample_minus_bg
+            >= MIN_SAMPLE_MINUS_BACKGROUND
+        )
+
+        and
+
+        (
+            sample_bg_ratio
+            >= BACKGROUND_FOLD_CHANGE
+        )
+
+    )
+
+
+    # -----------------------------
+    # Final MS1 keep
+    # -----------------------------
+
+    final_keep = int(
+
+        (
+            best_sample[
+                "ms1_isotope_positive_raw"
+            ]
+            == 1
+        )
+
+        and
+
+        (
+            background_subtracted
+            == 1
+        )
+
+    )
+
+
+    results.append({
+
+        "ms1_isotope_positive_raw":
+            best_sample[
+                "ms1_isotope_positive_raw"
+            ],
+
+        "ms1_isotope_score":
+            best_sample[
+                "ms1_isotope_score"
+            ],
+
+        "ms1_background_subtracted":
+            background_subtracted,
+
+        "ms1_final_keep":
+            final_keep,
+
+        "best_sample_file":
+            best_sample[
+                "file"
+            ],
+
+        "sample_files_used":
+            ";".join(
+                sample_files
+            ),
+
+        "background_files_used":
+            ";".join(
+                BACKGROUND_FILES
+            ),
+
+        "sample_M_intensity":
+            sample_M,
+
+        "background_M_intensity_max":
+            bg_max,
+
+        "sample_minus_background":
+            sample_minus_bg,
+
+        "sample_to_background_ratio":
+            sample_bg_ratio,
+
+        "best_matching_n_chlorines":
+            best_sample[
+                "best_matching_n_chlorines"
+            ],
+
+        "M_plus_2_intensity":
+            best_sample[
+                "M_plus_2_intensity"
+            ],
+
+        "M_plus_4_intensity":
+            best_sample[
+                "M_plus_4_intensity"
+            ],
+
+        "M_plus_2_over_M_ratio":
+            best_sample[
+                "M_plus_2_over_M_ratio"
+            ],
+
+        "M_plus_4_over_M_ratio":
+            best_sample[
+                "M_plus_4_over_M_ratio"
+            ],
+
+        "M2_ratio_error":
+            best_sample[
+                "M2_ratio_error"
+            ],
+
+        "M4_ratio_error":
+            best_sample[
+                "M4_ratio_error"
+            ],
+
+        "n_ms1_scans_used":
+            best_sample[
+                "n_ms1_scans_used"
+            ],
+
+        "low_M_intensity_flag":
+            best_sample[
+                "low_M_intensity_flag"
+            ],
+
+        "ms1_status":
+            "processed"
+
+    })
+
+
+ms1_df = pd.DataFrame(
+    results
+)
+
+out = pd.concat(
+
+    [
+        df.reset_index(
+            drop=True
+        ),
+
+        ms1_df.reset_index(
+            drop=True
+        )
+    ],
+
+    axis=1
+)
+
+
+# ============================================================
+# MERGE RULE4 SCORE
+#
+# IMPORTANT:
+# Rule4 is retained as independent supporting MS2 evidence.
+# It does NOT contribute to CombinedScore.
+# ============================================================
+
+r4 = pd.read_csv(
+    RULE4_ALL_FILE
+)
+
+r4["FeatureID"] = (
+    make_feature_id(
+        r4
+    )
+)
+
+
+rule4_score_col = (
+    find_score_col(
+
+        r4,
+
+        [
+
+            "rule4_cl_fragment_pair_score",
+            "Rule4_score",
+            "rule4_score"
+
+        ]
+    )
+)
+
+
+r4_score = (
+
+    r4[
+        [
+            "FeatureID",
+            rule4_score_col
+        ]
+    ]
+
+    .drop_duplicates(
+        "FeatureID"
+    )
+
+    .copy()
+)
+
+
+r4_score.columns = [
+
+    "FeatureID",
+    "rule4_cl_fragment_pair_score"
+
+]
+
+
+out = out.merge(
+
+    r4_score,
+
+    on="FeatureID",
+
+    how="left"
+
+)
+
+
+out[
+    "rule4_cl_fragment_pair_score"
+] = (
+
+    out[
+        "rule4_cl_fragment_pair_score"
+    ]
+
+    .fillna(0.0)
+
+    .astype(float)
+)
+
+
+# ============================================================
+# OPTION B COMBINED SCORE
+#
+# NEW FORMULA:
+#
+# CombinedScore =
+#     0.60 × ChloroFinder probability
+#   + 0.40 × MS1 isotope score
+#
+# Rule4 is NOT included.
+# ============================================================
+
+out["CombinedScore"] = (
+
+    0.60
+    * out[
+        "ChloroFinder_probability"
+    ]
+
+    +
+
+    0.40
+    * out[
+        "ms1_isotope_score"
+    ]
+
+)
+
+
+out["CombinedScore_positive"] = (
+
+    out[
+        "CombinedScore"
+    ]
+
+    >= COMBINED_SCORE_THRESHOLD
+
+).astype(int)
+
+
+# ============================================================
+# INDEPENDENT EVIDENCE SCORE
+#
+# Rule4 remains here because this variable counts
+# independent evidence streams rather than contributing
+# to the weighted CombinedScore.
+# ============================================================
+
+out["OptionB_EvidenceScore"] = (
+
+    out[
+        "ms1_final_keep"
+    ]
+
+    +
+
+    out[
+        "ChloroFinder_default"
+    ]
+
+    +
+
+    (
+        out[
+            "rule4_cl_fragment_pair_score"
+        ]
+        > 0
+    ).astype(int)
+
+)
+
+
+# ============================================================
+# PRIORITIZATION TIERS
+# ============================================================
+
+out["OptionB_Tier"] = (
+    "Tier 5: Low priority"
+)
+
+
+# -----------------------------
+# Tier 1
+# Combined score positive
+# AND MS1 positive
+# AND ChloroFinder >= 0.50
+# -----------------------------
+
+out.loc[
+
+    (
+        out[
+            "CombinedScore_positive"
+        ]
+        == 1
+    )
+
+    &
+
+    (
+        out[
+            "ms1_final_keep"
+        ]
+        == 1
+    )
+
+    &
+
+    (
+        out[
+            "ChloroFinder_default"
+        ]
+        == 1
+    ),
+
+    "OptionB_Tier"
+
+] = (
+    "Tier 1: High confidence "
+    "CombinedScore + MS1 + ML"
+)
+
+
+# -----------------------------
+# Tier 2
+# CombinedScore positive
+# -----------------------------
+
+out.loc[
+
+    (
+        out[
+            "OptionB_Tier"
+        ]
+        == "Tier 5: Low priority"
+    )
+
+    &
+
+    (
+        out[
+            "CombinedScore_positive"
+        ]
+        == 1
+    ),
+
+    "OptionB_Tier"
+
+] = (
+    "Tier 2: CombinedScore positive"
+)
+
+
+# -----------------------------
+# Tier 3
+# MS1 + ML agreement
+# -----------------------------
+
+out.loc[
+
+    (
+        out[
+            "OptionB_Tier"
+        ]
+        == "Tier 5: Low priority"
+    )
+
+    &
+
+    (
+        out[
+            "ms1_final_keep"
+        ]
+        == 1
+    )
+
+    &
+
+    (
+        out[
+            "ChloroFinder_default"
+        ]
+        == 1
+    ),
+
+    "OptionB_Tier"
+
+] = (
+    "Tier 3: MS1 + ML agreement"
+)
+
+
+# -----------------------------
+# Tier 4
+# One strong evidence stream
+# -----------------------------
+
+out.loc[
+
+    (
+        out[
+            "OptionB_Tier"
+        ]
+        == "Tier 5: Low priority"
+    )
+
+    &
+
+    (
+
+        (
+            out[
+                "ChloroFinder_high"
+            ]
+            == 1
+        )
+
+        |
+
+        (
+            out[
+                "ms1_final_keep"
+            ]
+            == 1
+        )
+
+    ),
+
+    "OptionB_Tier"
+
+] = (
+    "Tier 4: Single strong evidence"
+)
+
+
+out["OptionB_Prioritized"] = (
+
+    out[
+        "OptionB_Tier"
+    ]
+
+    != "Tier 5: Low priority"
+
+).astype(int)
+
+
+# ============================================================
+# OPTIONAL RULE4 SUPPORT FLAGS
+#
+# These do NOT affect CombinedScore.
+# They simply indicate whether Rule4 independently
+# supports a candidate.
+# ============================================================
+
+out["Rule4_support"] = (
+
+    out[
+        "rule4_cl_fragment_pair_score"
+    ]
+    > 0
+
+).astype(int)
+
+
+out["CombinedScore_with_Rule4_support"] = (
+
+    (
+        out[
+            "CombinedScore_positive"
+        ]
+        == 1
+    )
+
+    &
+
+    (
+        out[
+            "Rule4_support"
+        ]
+        == 1
+    )
+
+).astype(int)
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+summary = pd.DataFrame([
+
+    {
+        "Category":
+            "Total features",
+
+        "Count":
+            len(out)
+    },
+
+    {
+        "Category":
+            "MS1 isotope raw positive",
+
+        "Count":
+            int(
+                out[
+                    "ms1_isotope_positive_raw"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "MS1 background-subtracted positive",
+
+        "Count":
+            int(
+                out[
+                    "ms1_final_keep"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "ChloroFinder broad >=0.40",
+
+        "Count":
+            int(
+                out[
+                    "ChloroFinder_broad"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "ChloroFinder default >=0.50",
+
+        "Count":
+            int(
+                out[
+                    "ChloroFinder_default"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "ChloroFinder high >=0.60",
+
+        "Count":
+            int(
+                out[
+                    "ChloroFinder_high"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "Rule4 score > 0",
+
+        "Count":
+            int(
+                (
+                    out[
+                        "rule4_cl_fragment_pair_score"
+                    ]
+                    > 0
+                ).sum()
+            )
+    },
+
+    {
+        "Category":
+            "Combined Score >=0.60",
+
+        "Count":
+            int(
+                out[
+                    "CombinedScore_positive"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "Combined Score >=0.60 + Rule4 support",
+
+        "Count":
+            int(
+                out[
+                    "CombinedScore_with_Rule4_support"
+                ].sum()
+            )
+    },
+
+    {
+        "Category":
+            "MS1 + ChloroFinder default",
+
+        "Count":
+            int(
+                (
+                    (
+                        out[
+                            "ms1_final_keep"
+                        ]
+                        == 1
+                    )
+
+                    &
+
+                    (
+                        out[
+                            "ChloroFinder_default"
+                        ]
+                        == 1
+                    )
+                ).sum()
+            )
+    },
+
+    {
+        "Category":
+            "MS1 + ChloroFinder high",
+
+        "Count":
+            int(
+                (
+                    (
+                        out[
+                            "ms1_final_keep"
+                        ]
+                        == 1
+                    )
+
+                    &
+
+                    (
+                        out[
+                            "ChloroFinder_high"
+                        ]
+                        == 1
+                    )
+                ).sum()
+            )
+    },
+
+    {
+        "Category":
+            "Option B prioritized",
+
+        "Count":
+            int(
+                out[
+                    "OptionB_Prioritized"
+                ].sum()
+            )
+    }
+
+])
+
+
+tier_summary = (
+
+    out[
+        "OptionB_Tier"
+    ]
+
+    .value_counts()
+
+    .rename_axis(
+        "Tier"
+    )
+
+    .reset_index(
+        name="Count"
+    )
+)
+
+
+print(
+    "\nOption B Code 1 summary"
+)
+
+print(
+    summary.to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nTier summary"
+)
+
+print(
+    tier_summary.to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nCombinedScore summary"
+)
+
+print(
+    out[
+        "CombinedScore"
+    ].describe()
+)
+
+
+print(
+    "\nCombinedScore formula:"
+)
+
+print(
+    "0.60 × ChloroFinder probability "
+    "+ 0.40 × MS1 isotope score"
+)
+
+
+print(
+    "\nChloroFinder probability "
+    "by MS1 final keep"
+)
+
+print(
+
+    out.groupby(
+        "ms1_final_keep"
+    )[
+        "ChloroFinder_probability"
+    ]
+
+    .agg(
+        [
+            "count",
+            "mean",
+            "median",
+            "min",
+            "max"
+        ]
+    )
+
+)
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+out.to_csv(
+    OUT_ALL,
+    index=False
+)
+
+summary.to_csv(
+    OUT_SUMMARY,
+    index=False
+)
+
+
+# Prioritized candidates
+out[
+    out[
+        "OptionB_Prioritized"
+    ]
+    == 1
+].sort_values(
+
+    "CombinedScore",
+
+    ascending=False
+
+).to_csv(
+
+    OUT_PRIORITY,
+
+    index=False
+)
+
+
+# Higher-confidence candidate set
+out[
+    out[
+        "OptionB_Tier"
+    ].isin(
+        [
+            "Tier 1: High confidence CombinedScore + MS1 + ML",
+            "Tier 2: CombinedScore positive",
+            "Tier 3: MS1 + ML agreement"
+        ]
+    )
+].sort_values(
+
+    "CombinedScore",
+
+    ascending=False
+
+).to_csv(
+
+    OUT_HIGH_CONF,
+
+    index=False
+)
+
+
+# ============================================================
+# FIGURE A:
+# EVIDENCE COUNTS
+# ============================================================
+
+figA = pd.DataFrame({
+
+    "Evidence": [
+
+        "MS1 isotope",
+
+        "CF >=0.40",
+
+        "CF >=0.50",
+
+        "CF >=0.60",
+
+        "Rule4 support",
+
+        "Combined >=0.60",
+
+        "Option B prioritized"
+
+    ],
+
+    "Count": [
+
+        int(
+            out[
+                "ms1_final_keep"
+            ].sum()
+        ),
+
+        int(
+            out[
+                "ChloroFinder_broad"
+            ].sum()
+        ),
+
+        int(
+            out[
+                "ChloroFinder_default"
+            ].sum()
+        ),
+
+        int(
+            out[
+                "ChloroFinder_high"
+            ].sum()
+        ),
+
+        int(
+            out[
+                "Rule4_support"
+            ].sum()
+        ),
+
+        int(
+            out[
+                "CombinedScore_positive"
+            ].sum()
+        ),
+
+        int(
+            out[
+                "OptionB_Prioritized"
+            ].sum()
+        )
+
+    ]
+})
+
+
+plt.figure(
+    figsize=(10, 5)
+)
+
+bars = plt.bar(
+    figA["Evidence"],
+    figA["Count"]
+)
+
+
+for bar in bars:
+
+    h = bar.get_height()
+
+    plt.text(
+
+        bar.get_x()
+        + bar.get_width() / 2,
+
+        h,
+
+        str(
+            int(h)
+        ),
+
+        ha="center",
+        va="bottom",
+
+        fontsize=11
+    )
+
+
+plt.ylabel(
+    "Number of features",
+    fontsize=12
+)
+
+plt.title(
+    "A. Independent evidence and prioritization counts",
+    fontsize=13
+)
+
+plt.xticks(
+    rotation=30,
+    ha="right",
+    fontsize=10
+)
+
+plt.yticks(
+    fontsize=10
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{FIG_DIR}/Figure_A_OptionB_evidence_counts.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE B:
+# TIER COUNTS
+# ============================================================
+
+tier_order = [
+
+    "Tier 1: High confidence CombinedScore + MS1 + ML",
+
+    "Tier 2: CombinedScore positive",
+
+    "Tier 3: MS1 + ML agreement",
+
+    "Tier 4: Single strong evidence",
+
+    "Tier 5: Low priority"
+
+]
+
+
+tier_counts = (
+
+    out[
+        "OptionB_Tier"
+    ]
+
+    .value_counts()
+
+    .reindex(
+        tier_order
+    )
+
+    .fillna(0)
+
+)
+
+
+plt.figure(
+    figsize=(10, 5)
+)
+
+bars = plt.bar(
+
+    tier_counts.index,
+
+    tier_counts.values
+
+)
+
+
+for bar in bars:
+
+    h = bar.get_height()
+
+    plt.text(
+
+        bar.get_x()
+        + bar.get_width() / 2,
+
+        h,
+
+        str(
+            int(h)
+        ),
+
+        ha="center",
+        va="bottom",
+
+        fontsize=11
+    )
+
+
+plt.ylabel(
+    "Number of features",
+    fontsize=12
+)
+
+plt.title(
+    "B. Prioritization tiers",
+    fontsize=13
+)
+
+plt.xticks(
+    rotation=35,
+    ha="right",
+    fontsize=9
+)
+
+plt.yticks(
+    fontsize=10
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{FIG_DIR}/Figure_B_OptionB_tiers.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE C:
+# CF PROBABILITY BY MS1 STATUS
+# ============================================================
+
+data = [
+
+    out.loc[
+        out[
+            "ms1_final_keep"
+        ]
+        == 0,
+
+        "ChloroFinder_probability"
+
+    ].values,
+
+    out.loc[
+        out[
+            "ms1_final_keep"
+        ]
+        == 1,
+
+        "ChloroFinder_probability"
+
+    ].values
+
+]
+
+
+plt.figure(
+    figsize=(6, 5)
+)
+
+plt.boxplot(
+
+    data,
+
+    labels=[
+        "MS1 negative",
+        "MS1 positive"
+    ],
+
+    showfliers=False
+)
+
+
+plt.ylabel(
+    "ChloroFinder probability",
+    fontsize=12
+)
+
+plt.title(
+    "C. ChloroFinder probability by MS1 isotope evidence",
+    fontsize=13
+)
+
+plt.xticks(
+    fontsize=11
+)
+
+plt.yticks(
+    fontsize=10
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{FIG_DIR}/Figure_C_CF_probability_by_MS1_status.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE D:
+# ML PROBABILITY VS MS1 ISOTOPE SCORE
+#
+# Rule4 can still be reflected indirectly through
+# the independent evidence count.
+# ============================================================
+
+plt.figure(
+    figsize=(7, 6)
+)
+
+scatter = plt.scatter(
+
+    out[
+        "ChloroFinder_probability"
+    ],
+
+    out[
+        "ms1_isotope_score"
+    ],
+
+    c=out[
+        "OptionB_EvidenceScore"
+    ],
+
+    cmap="RdYlGn",
+
+    alpha=0.5,
+
+    s=15
+)
+
+
+plt.axvline(
+
+    CF_DEFAULT_THRESHOLD,
+
+    color="gray",
+
+    linestyle="--",
+
+    lw=1,
+
+    label=(
+        f"CF threshold = "
+        f"{CF_DEFAULT_THRESHOLD}"
+    )
+)
+
+
+plt.axhline(
+
+    0.5,
+
+    color="gray",
+
+    linestyle=":",
+
+    lw=1,
+
+    label="MS1 score = 0.5"
+)
+
+
+plt.xlabel(
+    "ChloroFinder probability",
+    fontsize=12
+)
+
+plt.ylabel(
+    "MS1 isotope score",
+    fontsize=12
+)
+
+plt.title(
+    "D. ML probability vs MS1 isotope score",
+    fontsize=13
+)
+
+plt.colorbar(
+    scatter,
+    label="Independent evidence score"
+)
+
+plt.legend(
+    fontsize=9
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{FIG_DIR}/Figure_D_ML_vs_MS1_scatter.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE E:
+# COMBINED SCORE DISTRIBUTION
+#
+# NEW:
+# CombinedScore = 0.60 × ML + 0.40 × MS1
+# ============================================================
+
+plt.figure(
+    figsize=(7, 5)
+)
+
+plt.hist(
+
+    out[
+        "CombinedScore"
+    ],
+
+    bins=40,
+
+    alpha=0.8
+)
+
+
+plt.axvline(
+
+    COMBINED_SCORE_THRESHOLD,
+
+    color="red",
+
+    linestyle="--",
+
+    lw=2,
+
+    label=(
+
+        f"Threshold = "
+        f"{COMBINED_SCORE_THRESHOLD} "
+
+        f"(n="
+        f"{int(out['CombinedScore_positive'].sum())})"
+
+    )
+)
+
+
+plt.xlabel(
+    "Combined Score = 0.60×ML + 0.40×MS1",
+    fontsize=12
+)
+
+plt.ylabel(
+    "Number of features",
+    fontsize=12
+)
+
+plt.title(
+    "E. Combined Score Distribution",
+    fontsize=13
+)
+
+plt.legend(
+    fontsize=10
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    f"{FIG_DIR}/Figure_E_combined_score_distribution.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# OPTIONAL DIAGNOSTIC:
+# HOW OFTEN RULE4 SUPPORTS COMBINED-SCORE CANDIDATES
+# ============================================================
+
+rule4_diag = pd.crosstab(
+
+    out[
+        "CombinedScore_positive"
+    ],
+
+    out[
+        "Rule4_support"
+    ],
+
+    rownames=[
+        "CombinedScore_positive"
+    ],
+
+    colnames=[
+        "Rule4_support"
+    ]
+
+)
+
+print(
+    "\nCombinedScore vs Rule4 support:"
+)
+
+print(
+    rule4_diag
+)
+
+
+# ============================================================
+# DONE
+# ============================================================
+
+print(
+    "\nSaved:"
+)
+
+print(
+    OUT_ALL
+)
+
+print(
+    OUT_PRIORITY
+)
+
+print(
+    OUT_HIGH_CONF
+)
+
+print(
+    OUT_SUMMARY
+)
+
+print(
+    FIG_DIR
+)
