@@ -1,0 +1,526 @@
+# ============================================================
+# CODE 2: OPTION A ON EXPERIMENTAL MGF
+# ChloroFinder RF vs MS2-only expert rules
+# Rules used: Rule 2 + Rule 3 + Rule 4
+# Rule 1 / MS1 isotope evidence is NOT used
+# ============================================================
+
+import os
+import ast
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from itertools import combinations
+from scipy.sparse import hstack, csr_matrix
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+MGF_CSV = "/content/mgf_extracted.csv"
+MODEL_PATH = "/content/chlorofinder_massbank.pkl"
+
+RULE2_FILE = "/content/rule2_hcl_loss_all_features_precursor_based.csv"
+RULE3_FILE = "/content/rule3_cl_radical_loss_all_features.csv"
+RULE4_FILE = "/content/rule4_ms2_cl_fragment_pair_all_features_BALANCED.csv"
+
+FIG_DIR = "/content/OptionA_MGF_ChloroFinder_vs_MS2Rules_Figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+OUT_ALL             = "/content/OptionA_MGF_ChloroFinder_vs_Rules234_all_features.csv"
+OUT_SUMMARY         = "/content/OptionA_MGF_ChloroFinder_vs_Rules234_summary.csv"
+OUT_ML_ONLY         = "/content/OptionA_MGF_ML_only_candidates.csv"
+OUT_RULE_ONLY       = "/content/OptionA_MGF_rule_only_candidates.csv"
+OUT_OVERLAP         = "/content/OptionA_MGF_ML_rule_overlap_candidates.csv"
+OUT_THRESHOLD_SWEEP = "/content/OptionA_MGF_threshold_sweep.csv"
+
+MZ_COL        = "mz_values"
+RT_COL        = "RTINSECONDS"
+PRECURSOR_COL = "PEPMASS"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_parse_list(x):
+    if isinstance(x, list):
+        return [float(v) for v in x]
+    if pd.isna(x):
+        return []
+    s = str(x).strip()
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, (list, tuple, np.ndarray)):
+            return [float(v) for v in val]
+    except Exception:
+        pass
+    for sep in [";", "|", ":"]:
+        s = s.replace(sep, ",")
+    try:
+        return [float(v.strip()) for v in s.strip("[]()").split(",") if v.strip()]
+    except Exception:
+        return []
+
+
+def round_unique(values, dp):
+    out = []
+    seen = set()
+    for v in values:
+        try:
+            rv = round(float(v), dp)
+            if rv > 0 and rv not in seen:
+                seen.add(rv)
+                out.append(rv)
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def compute_delta_mz_list(frag_list, round_dp=3, min_delta=0.001):
+    if len(frag_list) < 2:
+        return []
+    frags  = sorted(set(float(f) for f in frag_list))
+    deltas = []
+    for a, b in combinations(frags, 2):
+        d = abs(b - a)
+        if d >= min_delta:
+            deltas.append(round(d, round_dp))
+    return sorted(set(deltas))
+
+
+def make_feature_id(df):
+    return (
+        df[PRECURSOR_COL].round(4).astype(str)
+        + "_"
+        + df[RT_COL].round(1).astype(str)
+    )
+
+
+def find_col(df, possible_names):
+    for c in possible_names:
+        if c in df.columns:
+            return c
+    raise ValueError(
+        f"None of these columns found: {possible_names}\n"
+        f"Available columns: {list(df.columns)}"
+    )
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+bundle   = joblib.load(MODEL_PATH)
+model    = bundle["model"]
+mlb_frag = bundle["mlb_frag"]
+mlb_delta= bundle["mlb_delta"]
+ROUND_DP  = bundle.get("round_dp", 3)
+THRESHOLD = bundle.get("threshold", 0.60)
+
+print("Loaded model:", MODEL_PATH)
+print("Using ROUND_DP from model:", ROUND_DP)
+print("Using threshold:", THRESHOLD)
+
+# ============================================================
+# LOAD MGF FEATURES
+# ============================================================
+
+df = pd.read_csv(MGF_CSV)
+
+required_cols = [MZ_COL, RT_COL, PRECURSOR_COL]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing required columns in MGF CSV: {missing}")
+
+df["FeatureID"]        = make_feature_id(df)
+df["_mz_list"]         = df[MZ_COL].apply(safe_parse_list)
+df["frag_list_model"]  = df["_mz_list"].apply(lambda x: round_unique(x, ROUND_DP))
+df["delta_list_model"] = df["frag_list_model"].apply(
+    lambda x: compute_delta_mz_list(x, round_dp=ROUND_DP)
+)
+
+print("\nMGF check")
+print("Rows:", len(df))
+print("Example raw fragments:", df["_mz_list"].iloc[0][:10])
+print("Example rounded fragments:", df["frag_list_model"].iloc[0][:10])
+print("Example delta fragments:", df["delta_list_model"].iloc[0][:10])
+
+print("\nMassBank model vocabulary check")
+print("Fragment vocab sample:", list(mlb_frag.classes_[:10]))
+print("Delta vocab sample:", list(mlb_delta.classes_[:10]))
+
+# ============================================================
+# BUILD MODEL FEATURES
+# ============================================================
+
+X_frag  = csr_matrix(mlb_frag.transform(df["frag_list_model"]),  dtype=np.float32)
+X_delta = csr_matrix(mlb_delta.transform(df["delta_list_model"]), dtype=np.float32)
+X       = hstack([X_frag, X_delta], format="csr").astype(np.float32)
+
+frag_vocab  = set(mlb_frag.classes_)
+delta_vocab = set(mlb_delta.classes_)
+
+df["n_model_frag_matches"]  = df["frag_list_model"].apply(
+    lambda xs: len(set(xs).intersection(frag_vocab))
+)
+df["n_model_delta_matches"] = df["delta_list_model"].apply(
+    lambda xs: len(set(xs).intersection(delta_vocab))
+)
+
+print("\nFragment vocabulary matching")
+print("Mean matched fragments per spectrum:", np.mean(df["n_model_frag_matches"]))
+print("Median matched fragments per spectrum:", np.median(df["n_model_frag_matches"]))
+print("Spectra with zero matched fragments:", int((df["n_model_frag_matches"] == 0).sum()))
+
+print("\nDelta-m/z vocabulary matching")
+print("Mean matched deltas per spectrum:", np.mean(df["n_model_delta_matches"]))
+print("Median matched deltas per spectrum:", np.median(df["n_model_delta_matches"]))
+print("Spectra with zero matched deltas:", int((df["n_model_delta_matches"] == 0).sum()))
+
+# ============================================================
+# PREDICT WITH CHLOROFINDER
+# ============================================================
+
+df["ChloroFinder_probability"] = model.predict_proba(X)[:, 1]
+df["ChloroFinder_positive"]    = (df["ChloroFinder_probability"] >= THRESHOLD).astype(int)
+
+print("\nPrediction summary")
+print("Experimental MGF features:", len(df))
+print("ChloroFinder positives:", int(df["ChloroFinder_positive"].sum()))
+print("Threshold:", THRESHOLD)
+
+# ============================================================
+# LOAD RULE OUTPUTS
+# ============================================================
+
+r2 = pd.read_csv(RULE2_FILE)
+r3 = pd.read_csv(RULE3_FILE)
+r4 = pd.read_csv(RULE4_FILE)
+
+for r in [r2, r3, r4]:
+    missing_rule_cols = [c for c in [PRECURSOR_COL, RT_COL] if c not in r.columns]
+    if missing_rule_cols:
+        raise ValueError(f"Missing required columns in rule file: {missing_rule_cols}")
+    r["FeatureID"] = make_feature_id(r)
+
+r2_col = find_col(r2, ["rule2_hcl_loss", "Rule2", "rule2_positive"])
+r3_col = find_col(r3, ["rule3_cl_radical_loss", "Rule3", "rule3_positive"])
+r4_col = find_col(r4, ["rule4_cl_fragment_pair", "Rule4", "rule4_positive"])
+
+r2_small = r2[["FeatureID", r2_col]].copy().drop_duplicates("FeatureID")
+r3_small = r3[["FeatureID", r3_col]].copy().drop_duplicates("FeatureID")
+r4_small = r4[["FeatureID", r4_col]].copy().drop_duplicates("FeatureID")
+
+r2_small.columns = ["FeatureID", "Rule2_HCl_loss"]
+r3_small.columns = ["FeatureID", "Rule3_Cl_radical_loss"]
+r4_small.columns = ["FeatureID", "Rule4_Cl_fragment_pair"]
+
+# ============================================================
+# MERGE RF + RULES
+# ============================================================
+
+out = (
+    df
+    .merge(r2_small, on="FeatureID", how="left")
+    .merge(r3_small, on="FeatureID", how="left")
+    .merge(r4_small, on="FeatureID", how="left")
+)
+
+for col in ["Rule2_HCl_loss", "Rule3_Cl_radical_loss", "Rule4_Cl_fragment_pair"]:
+    out[col] = out[col].fillna(0).astype(int)
+
+out["RuleScore_MS2"]      = (out["Rule2_HCl_loss"]
+                              + out["Rule3_Cl_radical_loss"]
+                              + out["Rule4_Cl_fragment_pair"])
+out["RuleBased_MS2_any"]  = (out["RuleScore_MS2"] >= 1).astype(int)
+out["RuleBased_MS2_strict"]= (out["RuleScore_MS2"] >= 2).astype(int)
+
+out["Agreement_Category"] = "Neither"
+out.loc[(out["ChloroFinder_positive"]==1) & (out["RuleBased_MS2_any"]==1),
+        "Agreement_Category"] = "ML + Rules"
+out.loc[(out["ChloroFinder_positive"]==1) & (out["RuleBased_MS2_any"]==0),
+        "Agreement_Category"] = "ML only"
+out.loc[(out["ChloroFinder_positive"]==0) & (out["RuleBased_MS2_any"]==1),
+        "Agreement_Category"] = "Rules only"
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+summary = pd.DataFrame([
+    {"Category": "Total MGF features",                  "Count": len(out)},
+    {"Category": "ChloroFinder positive",               "Count": int(out["ChloroFinder_positive"].sum())},
+    {"Category": "Rule2 HCl loss positive",             "Count": int(out["Rule2_HCl_loss"].sum())},
+    {"Category": "Rule3 Cl radical loss positive",      "Count": int(out["Rule3_Cl_radical_loss"].sum())},
+    {"Category": "Rule4 Cl fragment pair positive",     "Count": int(out["Rule4_Cl_fragment_pair"].sum())},
+    {"Category": "Any MS2 rule positive",               "Count": int(out["RuleBased_MS2_any"].sum())},
+    {"Category": "Strict MS2 rule positive, score >=2", "Count": int(out["RuleBased_MS2_strict"].sum())},
+    {"Category": "ML + Rules overlap",                  "Count": int(((out["ChloroFinder_positive"]==1) & (out["RuleBased_MS2_any"]==1)).sum())},
+    {"Category": "ML only",                             "Count": int(((out["ChloroFinder_positive"]==1) & (out["RuleBased_MS2_any"]==0)).sum())},
+    {"Category": "Rules only",                          "Count": int(((out["ChloroFinder_positive"]==0) & (out["RuleBased_MS2_any"]==1)).sum())},
+    {"Category": "Neither",                             "Count": int(((out["ChloroFinder_positive"]==0) & (out["RuleBased_MS2_any"]==0)).sum())},
+])
+
+print("\nOption A MGF summary")
+print(summary)
+print("\nRuleScore_MS2 distribution")
+print(out["RuleScore_MS2"].value_counts().sort_index())
+print("\nChloroFinder probability by RuleScore_MS2")
+print(out.groupby("RuleScore_MS2")["ChloroFinder_probability"]
+        .agg(["count", "mean", "median", "min", "max"]))
+
+# ============================================================
+# THRESHOLD SWEEP
+# ============================================================
+
+threshold_rows = []
+for t in np.arange(0.10, 0.96, 0.05):
+    pred_t = out["ChloroFinder_probability"] >= t
+    overlap = int((pred_t & (out["RuleBased_MS2_any"] == 1)).sum())
+    threshold_rows.append({
+        "threshold":                      round(float(t), 2),
+        "ChloroFinder_positive":          int(pred_t.sum()),
+        "ML_plus_rules_overlap":          overlap,
+        "ML_only":                        int((pred_t & (out["RuleBased_MS2_any"]==0)).sum()),
+        "Rules_only":                     int((~pred_t & (out["RuleBased_MS2_any"]==1)).sum()),
+        "Rule_positive_recovery_percent": round(
+            100 * overlap / max(int(out["RuleBased_MS2_any"].sum()), 1), 2
+        ),
+    })
+
+threshold_df = pd.DataFrame(threshold_rows)
+threshold_df.to_csv(OUT_THRESHOLD_SWEEP, index=False)
+print("\nThreshold sweep")
+print(threshold_df.to_string(index=False))
+
+# ============================================================
+# SAVE TABLES
+# ============================================================
+
+out.to_csv(OUT_ALL, index=False)
+summary.to_csv(OUT_SUMMARY, index=False)
+
+out[out["Agreement_Category"]=="ML only"].sort_values(
+    "ChloroFinder_probability", ascending=False).to_csv(OUT_ML_ONLY, index=False)
+out[out["Agreement_Category"]=="Rules only"].sort_values(
+    "RuleScore_MS2", ascending=False).to_csv(OUT_RULE_ONLY, index=False)
+out[out["Agreement_Category"]=="ML + Rules"].sort_values(
+    ["RuleScore_MS2","ChloroFinder_probability"], ascending=False).to_csv(OUT_OVERLAP, index=False)
+
+# ============================================================
+# FIGURE A: METHOD POSITIVE COUNTS
+# ============================================================
+
+figA_data = pd.DataFrame({
+    "Method": ["ChloroFinder RF", "Rule2\nHCl loss", "Rule3\nCl radical",
+                "Rule4\nCl pair", "Any MS2\nrule", "Strict MS2\nscore >=2"],
+    "Count":  [int(out["ChloroFinder_positive"].sum()),
+               int(out["Rule2_HCl_loss"].sum()),
+               int(out["Rule3_Cl_radical_loss"].sum()),
+               int(out["Rule4_Cl_fragment_pair"].sum()),
+               int(out["RuleBased_MS2_any"].sum()),
+               int(out["RuleBased_MS2_strict"].sum())]
+})
+
+plt.figure(figsize=(9, 5))
+bars = plt.bar(figA_data["Method"], figA_data["Count"])
+for bar in bars:
+    h = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, h, str(int(h)), ha="center", va="bottom")
+plt.ylabel("Number of MGF features")
+plt.title("A. MGF positives: ChloroFinder vs MS2 expert rules")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_A_positive_counts.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE B: AGREEMENT CATEGORIES
+# ============================================================
+
+order  = ["ML + Rules", "ML only", "Rules only", "Neither"]
+counts = out["Agreement_Category"].value_counts().reindex(order).fillna(0)
+
+plt.figure(figsize=(7, 5))
+bars = plt.bar(counts.index, counts.values)
+for bar in bars:
+    h = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, h, str(int(h)), ha="center", va="bottom")
+plt.ylabel("Number of MGF features")
+plt.title("B. Agreement between ChloroFinder and MS2 rules")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_B_agreement_categories.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE C: CHLOROFINDER PROBABILITY BY RULE SCORE
+# ============================================================
+
+scores = sorted(out["RuleScore_MS2"].unique())
+data_by_score = [out.loc[out["RuleScore_MS2"]==s, "ChloroFinder_probability"].values
+                 for s in scores]
+
+plt.figure(figsize=(7, 5))
+plt.boxplot(data_by_score, labels=[str(s) for s in scores], showfliers=False)
+plt.xlabel("MS2 expert rule score")
+plt.ylabel("ChloroFinder probability")
+plt.title("C. ChloroFinder probability by MS2 rule support")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_C_probability_by_rule_score.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE D: CHLOROFINDER SCORE DISTRIBUTION BY RULE STATUS
+# ============================================================
+
+plt.figure(figsize=(7, 5))
+plt.hist(out.loc[out["RuleBased_MS2_any"]==0, "ChloroFinder_probability"],
+         bins=30, alpha=0.7, label="No MS2 rule")
+plt.hist(out.loc[out["RuleBased_MS2_any"]==1, "ChloroFinder_probability"],
+         bins=30, alpha=0.7, label="At least one MS2 rule")
+plt.axvline(THRESHOLD, linestyle="--", color="black", label=f"Threshold = {THRESHOLD}")
+plt.xlabel("ChloroFinder probability")
+plt.ylabel("Number of MGF features")
+plt.title("D. ChloroFinder score distribution by rule status")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_D_probability_by_rule_status.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE E: RULE SCORE DISTRIBUTION
+# ============================================================
+
+score_counts = out["RuleScore_MS2"].value_counts().sort_index()
+
+plt.figure(figsize=(6, 5))
+bars = plt.bar(score_counts.index.astype(str), score_counts.values)
+for bar in bars:
+    h = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, h, str(int(h)), ha="center", va="bottom")
+plt.xlabel("MS2 rule score")
+plt.ylabel("Number of MGF features")
+plt.title("E. Distribution of MS2 expert-rule support")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_E_rule_score_distribution.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE F: PAIRWISE OVERLAP HEATMAP
+# ============================================================
+
+rule_cols = ["Rule2_HCl_loss", "Rule3_Cl_radical_loss",
+             "Rule4_Cl_fragment_pair", "ChloroFinder_positive"]
+
+overlap_matrix = pd.DataFrame(index=rule_cols, columns=rule_cols, dtype=int)
+for a in rule_cols:
+    for b in rule_cols:
+        overlap_matrix.loc[a, b] = int(((out[a]==1) & (out[b]==1)).sum())
+
+plt.figure(figsize=(7, 6))
+plt.imshow(overlap_matrix.values, cmap="Blues")
+plt.xticks(range(len(rule_cols)), rule_cols, rotation=45, ha="right")
+plt.yticks(range(len(rule_cols)), rule_cols)
+max_val = overlap_matrix.values.max()
+for i in range(len(rule_cols)):
+    for j in range(len(rule_cols)):
+        val   = int(overlap_matrix.values[i, j])
+        color = "white" if val > max_val * 0.6 else "black"
+        plt.text(j, i, val, ha="center", va="center", color=color)
+plt.colorbar(label="Shared positive features")
+plt.title("F. Pairwise overlap among ChloroFinder and MS2 rules")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_F_pairwise_overlap_heatmap.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE G: TOP ML-ONLY CANDIDATES
+# ============================================================
+
+ml_only = out[out["Agreement_Category"]=="ML only"].sort_values(
+    "ChloroFinder_probability", ascending=False).head(25)
+
+plt.figure(figsize=(8, 7))
+if len(ml_only) > 0:
+    plt.barh(ml_only["FeatureID"].astype(str).values[::-1],
+             ml_only["ChloroFinder_probability"].values[::-1])
+    plt.xlabel("ChloroFinder probability")
+    plt.ylabel("FeatureID")
+else:
+    plt.text(0.5, 0.5, "No ML-only candidates", ha="center", va="center")
+    plt.axis("off")
+plt.title("G. Top ML-only candidates missed by MS2 rules")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_G_top_ML_only_candidates.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE H: TOP OVERLAP CANDIDATES
+# ============================================================
+
+overlap = out[out["Agreement_Category"]=="ML + Rules"].sort_values(
+    ["RuleScore_MS2","ChloroFinder_probability"], ascending=False).head(25)
+
+plt.figure(figsize=(8, 7))
+if len(overlap) > 0:
+    plt.barh(overlap["FeatureID"].astype(str).values[::-1],
+             overlap["ChloroFinder_probability"].values[::-1])
+    plt.xlabel("ChloroFinder probability")
+    plt.ylabel("FeatureID")
+else:
+    plt.text(0.5, 0.5, "No ML + Rules overlap candidates", ha="center", va="center")
+    plt.axis("off")
+plt.title("H. Highest-confidence candidates supported by ML and MS2 rules")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_H_top_overlap_candidates.png", dpi=300)
+plt.show()
+
+# ============================================================
+# FIGURE I: THRESHOLD SWEEP (dual axis)
+# ============================================================
+
+fig, ax1 = plt.subplots(figsize=(9, 5))
+
+ax1.plot(threshold_df["threshold"], threshold_df["ChloroFinder_positive"],
+         marker="o", lw=2, color="steelblue", label="ChloroFinder positives")
+ax1.plot(threshold_df["threshold"], threshold_df["ML_plus_rules_overlap"],
+         marker="o", lw=2, color="darkorange", label="ML + Rules overlap")
+ax1.plot(threshold_df["threshold"], threshold_df["ML_only"],
+         marker="o", lw=2, linestyle="--", color="steelblue", alpha=0.5, label="ML only")
+
+ax1.axvline(0.50, color="gray",  linestyle=":", lw=1.5, label="Threshold = 0.50")
+ax1.axvline(0.60, color="black", linestyle=":", lw=1.5, label="Threshold = 0.60")
+
+ax1.set_xlabel("ChloroFinder Probability Threshold")
+ax1.set_ylabel("Number of MGF Features")
+ax1.legend(loc="upper right", fontsize=9)
+ax1.grid(alpha=0.3)
+
+ax2 = ax1.twinx()
+ax2.plot(threshold_df["threshold"], threshold_df["Rule_positive_recovery_percent"],
+         color="green", lw=2, linestyle="-.", marker="s", label="Rule recovery %")
+ax2.set_ylabel("Rule Positive Recovery (%)", color="green")
+ax2.tick_params(axis="y", labelcolor="green")
+ax2.set_ylim(0, 110)
+ax2.legend(loc="center right", fontsize=9)
+
+plt.title("I. ChloroFinder Threshold Sweep — Experimental MGF")
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/Figure_I_threshold_sweep.png", dpi=300)
+plt.show()
+
+# ============================================================
+# DONE
+# ============================================================
+
+print("\nSaved outputs:")
+print(OUT_ALL)
+print(OUT_SUMMARY)
+print(OUT_ML_ONLY)
+print(OUT_RULE_ONLY)
+print(OUT_OVERLAP)
+print(OUT_THRESHOLD_SWEEP)
+print("\nFigures saved to:", FIG_DIR)
+print("\nNote: These are experimental MGF comparison figures, not ROC/PR validation.")
+print("ROC/PR curves are in Code 1 using the labelled MassBank test set.")
